@@ -71,3 +71,50 @@ def get_credit_score(client_id: int, company_id: int) -> dict:
     """
     result = _post("/credit-score", {"clientId": client_id, "companyId": company_id})
     return result.get("creditScore", {}) if isinstance(result, dict) else {}
+
+
+def create_contract(
+    company_id: int,
+    loan_id: int,
+    conversation_id: int,
+    borrower_client_id: int,
+    lender_client_id: int,
+    principal_amount: float,
+    interest_rate: float,
+    term_months: int,
+    contract_summary: str,
+) -> dict:
+    """Creates a digital loan contract once borrower and lender have agreed
+    on terms. Wraps smartloans_backend's existing digitalContracts API — the
+    borrower/lender still sign it themselves afterward (sign_contract action,
+    not exposed here since this agent never signs on anyone's behalf).
+
+    Args:
+        company_id: The company scoping the loan.
+        loan_id: The loanId the contract is for.
+        conversation_id: The loanChat conversationId the agreement came from.
+        borrower_client_id: The borrower's clientId.
+        lender_client_id: The lender's clientId.
+        principal_amount: The agreed loan amount.
+        interest_rate: The agreed annual interest rate (percent).
+        term_months: The agreed repayment term in months.
+        contract_summary: A short plain-text summary of the agreed terms,
+            stored as the contract's notes.
+
+    Returns:
+        The created contract record, or {"error": ...} on failure.
+    """
+    return _post("/digitalContracts", {
+        "contract": [{
+            "action": "create_contract",
+            "companyId": company_id,
+            "loanId": loan_id,
+            "conversationId": conversation_id,
+            "borrowerClientId": borrower_client_id,
+            "lenderClientId": lender_client_id,
+            "principalAmount": principal_amount,
+            "interestRate": interest_rate,
+            "termMonths": term_months,
+            "notes": contract_summary,
+        }]
+    })
