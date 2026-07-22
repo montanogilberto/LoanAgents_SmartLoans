@@ -14,7 +14,8 @@ import base64
 import json
 import uuid
 
-from fastapi import FastAPI
+import httpx
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from google.adk.runners import Runner
@@ -152,7 +153,14 @@ async def contract(req: ContractRequest) -> ContractResponse:
 
 
 class ExtractIdRequest(BaseModel):
-    imageFrontBase64: str
+    # URL is preferred — smartloans_backend already uploads every capture to
+    # its (public-read) blob container before this would ever run, so
+    # fetching server-side avoids round-tripping the same multi-MB image as
+    # base64 over the wire twice. base64 stays supported as a fallback for
+    # callers that haven't uploaded yet.
+    imageFrontUrl: str | None = None
+    imageBackUrl: str | None = None
+    imageFrontBase64: str | None = None
     imageBackBase64: str | None = None
 
 
@@ -174,6 +182,21 @@ def _decode_image(image_base64: str) -> bytes:
     return base64.b64decode(data)
 
 
+async def _fetch_image_bytes(url: str) -> bytes:
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        return resp.content
+
+
+async def _resolve_image(url: str | None, image_base64: str | None) -> bytes | None:
+    if url:
+        return await _fetch_image_bytes(url)
+    if image_base64:
+        return _decode_image(image_base64)
+    return None
+
+
 @app.post("/extract-id-fields", response_model=ExtractIdResponse)
 async def extract_id_fields(req: ExtractIdRequest) -> ExtractIdResponse:
     """Reads a Mexican INE photo (front, optionally back) and extracts KYC
@@ -182,6 +205,11 @@ async def extract_id_fields(req: ExtractIdRequest) -> ExtractIdResponse:
     fields (Domicilio, CURP, Clave de Elector) — this is the alternative
     for exactly those fields, and is instructed to return an empty string
     rather than guess whenever a field isn't actually legible."""
+    front_bytes = await _resolve_image(req.imageFrontUrl, req.imageFrontBase64)
+    if not front_bytes:
+        raise HTTPException(status_code=400, detail="imageFrontUrl or imageFrontBase64 is required")
+    back_bytes = await _resolve_image(req.imageBackUrl, req.imageBackBase64)
+
     user_id = f"idextract-{uuid.uuid4()}"
     session = await _session_service.create_session(
         app_name="loan_agents_id",
@@ -192,11 +220,11 @@ async def extract_id_fields(req: ExtractIdRequest) -> ExtractIdResponse:
 
     parts = [
         Part(text="FRONT image of the INE is attached below."),
-        Part.from_bytes(data=_decode_image(req.imageFrontBase64), mime_type="image/jpeg"),
+        Part.from_bytes(data=front_bytes, mime_type="image/jpeg"),
     ]
-    if req.imageBackBase64:
+    if back_bytes:
         parts.append(Part(text="BACK image of the INE is attached below."))
-        parts.append(Part.from_bytes(data=_decode_image(req.imageBackBase64), mime_type="image/jpeg"))
+        parts.append(Part.from_bytes(data=back_bytes, mime_type="image/jpeg"))
 
     message = Content(role="user", parts=parts)
 
