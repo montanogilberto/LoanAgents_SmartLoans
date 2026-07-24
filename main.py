@@ -318,14 +318,24 @@ class ValidateFaceRequest(BaseModel):
 
 class FaceValidationCheck(BaseModel):
     name: str
-    passed: bool
+    status: str = "CANNOT_ASSESS"             # PASS | FAIL | CANNOT_ASSESS
     detail: str = ""
 
 
 class ValidateFaceResponse(BaseModel):
     isValid: bool
     confidence: float = 0.0
+    # Richer signals for backend auditing — see the agent prompt/schema. All
+    # optional so an older/degraded model response still validates.
+    riskLevel: str = ""                       # LOW | MEDIUM | HIGH
+    recommendedAction: str = "REVIEW_MANUALLY"  # APPROVE | REVIEW_MANUALLY | REJECT
+    overallAssessment: str = ""
     checks: list[FaceValidationCheck] = []
+    observedFeatures: dict = {}
+    presentationAttackDetected: bool = False
+    identityConsistencyScore: float = 0.0     # same person across poses
+    ineSimilarityScore: float = 0.0           # that person vs. the INE
+    livenessScore: float = 0.0                # real live human
     failureReasons: list[str] = []
     # Which assets actually reached the model, so a caller can tell a genuine
     # "failed validation" from "we only sent it two of the five poses".
@@ -412,25 +422,38 @@ async def validate_face(req: ValidateFaceRequest) -> ValidateFaceResponse:
     checks = [
         FaceValidationCheck(
             name=c.get("name", ""),
-            passed=bool(c.get("passed", False)),
+            status=str(c.get("status", "CANNOT_ASSESS")),
             detail=c.get("detail", ""),
         )
         for c in result.get("checks", [])
         if isinstance(c, dict)
     ]
     if not result:
+        # Total failure — a human must look, don't silently reject or approve.
         return ValidateFaceResponse(
             isValid=False,
             confidence=0.0,
+            riskLevel="HIGH",
+            recommendedAction="REVIEW_MANUALLY",
+            overallAssessment="Validation agent returned no usable result.",
             checks=checks,
             failureReasons=["Validation agent returned no usable result."],
             assetsEvaluated=evaluated,
         )
 
+    observed = result.get("observedFeatures", {})
     return ValidateFaceResponse(
         isValid=bool(result.get("isValid", False)),
         confidence=float(result.get("confidence", 0.0) or 0.0),
+        riskLevel=str(result.get("riskLevel", "") or ""),
+        recommendedAction=str(result.get("recommendedAction", "REVIEW_MANUALLY") or "REVIEW_MANUALLY"),
+        overallAssessment=str(result.get("overallAssessment", "") or ""),
         checks=checks,
+        observedFeatures=observed if isinstance(observed, dict) else {},
+        presentationAttackDetected=bool(result.get("presentationAttackDetected", False)),
+        identityConsistencyScore=float(result.get("identityConsistencyScore", 0.0) or 0.0),
+        ineSimilarityScore=float(result.get("ineSimilarityScore", 0.0) or 0.0),
+        livenessScore=float(result.get("livenessScore", 0.0) or 0.0),
         failureReasons=result.get("failureReasons", []),
         assetsEvaluated=evaluated,
     )
