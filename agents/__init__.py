@@ -6,6 +6,7 @@ from agents.negotiation import negotiation_agent
 from agents.contract import contract_agent
 from agents.orchestrator import orchestrator_agent
 from agents.id_document import id_document_agent
+from agents.face_validation import face_validation_agent
 
 root_agent = orchestrator_agent
 
@@ -18,5 +19,6 @@ __all__ = [
     "contract_agent",
     "orchestrator_agent",
     "id_document_agent",
+    "face_validation_agent",
     "root_agent",
 ]
