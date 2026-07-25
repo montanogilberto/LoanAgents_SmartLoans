@@ -12,6 +12,7 @@ Run:
 """
 import base64
 import json
+import time
 import uuid
 
 import httpx
@@ -379,6 +380,7 @@ async def validate_face(req: ValidateFaceRequest) -> ValidateFaceResponse:
         evaluated.append(pose)
 
     if "front" not in evaluated:
+        print("[validate-face] REJECTED at input: no front face photo supplied")
         raise HTTPException(status_code=400, detail="front face photo is required")
 
     ine_bytes = await _resolve_asset(req.ineFront)
@@ -392,6 +394,9 @@ async def validate_face(req: ValidateFaceRequest) -> ValidateFaceResponse:
         parts.append(Part(text="PRESENCE VIDEO recorded during the same session."))
         parts.append(Part.from_bytes(data=video_bytes, mime_type="video/mp4"))
         evaluated.append("video")
+
+    started_at = time.monotonic()
+    print(f"[validate-face] START assetsEvaluated={evaluated}")
 
     user_id = f"facevalidation-{uuid.uuid4()}"
     session = await _session_service.create_session(
@@ -411,6 +416,7 @@ async def validate_face(req: ValidateFaceRequest) -> ValidateFaceResponse:
     updated = await _session_service.get_session(
         app_name="loan_agents_face", user_id=user_id, session_id=session.id
     )
+    elapsed_ms = int((time.monotonic() - started_at) * 1000)
     raw = updated.state.get("face_validation_result", "{}")
     try:
         result = json.loads(_strip_json_fences(raw)) if isinstance(raw, str) else raw
@@ -430,6 +436,10 @@ async def validate_face(req: ValidateFaceRequest) -> ValidateFaceResponse:
     ]
     if not result:
         # Total failure — a human must look, don't silently reject or approve.
+        print(
+            f"[validate-face] NO RESULT ({elapsed_ms}ms) — agent returned "
+            f"unusable output; raw={str(raw)[:300]!r} → REVIEW_MANUALLY"
+        )
         return ValidateFaceResponse(
             isValid=False,
             confidence=0.0,
@@ -440,6 +450,28 @@ async def validate_face(req: ValidateFaceRequest) -> ValidateFaceResponse:
             failureReasons=["Validation agent returned no usable result."],
             assetsEvaluated=evaluated,
         )
+
+    # The verdict, for audit. This is a loan-gating KYC decision — log the
+    # outcome, the three independent scores, the non-passing checks (FAIL vs
+    # CANNOT_ASSESS kept distinct), and the reasons, so any approval/rejection
+    # is traceable server-side without re-running the model.
+    print(
+        "[validate-face] VERDICT " + json.dumps({
+            "elapsedMs": elapsed_ms,
+            "isValid": bool(result.get("isValid", False)),
+            "confidence": result.get("confidence"),
+            "riskLevel": result.get("riskLevel"),
+            "recommendedAction": result.get("recommendedAction"),
+            "presentationAttackDetected": bool(result.get("presentationAttackDetected", False)),
+            "identityConsistencyScore": result.get("identityConsistencyScore"),
+            "ineSimilarityScore": result.get("ineSimilarityScore"),
+            "livenessScore": result.get("livenessScore"),
+            "assetsEvaluated": evaluated,
+            "failChecks": [c.name for c in checks if c.status == "FAIL"],
+            "cannotAssessChecks": [c.name for c in checks if c.status == "CANNOT_ASSESS"],
+            "failureReasons": result.get("failureReasons", []),
+        }, ensure_ascii=False)
+    )
 
     observed = result.get("observedFeatures", {})
     return ValidateFaceResponse(
