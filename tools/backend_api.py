@@ -140,6 +140,23 @@ def get_installment_schedule(loan_id: int, company_id: int) -> list[dict]:
     return result.get("installments", []) if isinstance(result, dict) else []
 
 
+def get_my_offers(client_id: int, company_id: int) -> list[dict]:
+    """Fetches the ACTIVE capital offers this lender has published in the P2P
+    marketplace (announced capital — distinct from wallet money).
+
+    Args:
+        client_id: The lender's clientId.
+        company_id: The company scoping the offers.
+
+    Returns:
+        List of this lender's active offers (availableCapital, minRate,
+        maxRate, term range).
+    """
+    result = _post("/all_loanOffers", {"loanOffers": [{"companyId": company_id, "isActive": True}]})
+    offers = result.get("loanOffers", []) if isinstance(result, dict) else []
+    return [o for o in offers if o.get("lenderId") == client_id]
+
+
 def get_client_contracts(client_id: int, company_id: int) -> list[dict]:
     """Fetches every digital contract where this client is the borrower or the
     lender (Contrato de Crédito P2P + Pagaré metadata).

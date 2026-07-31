@@ -16,6 +16,7 @@ from tools.backend_api import (
     get_bank_accounts,
     get_installment_schedule,
     get_client_contracts,
+    get_my_offers,
 )
 
 support_agent = Agent(
@@ -34,6 +35,7 @@ support_agent = Agent(
         FunctionTool(func=get_bank_accounts),
         FunctionTool(func=get_installment_schedule),
         FunctionTool(func=get_client_contracts),
+        FunctionTool(func=get_my_offers),
     ],
     output_key="support_reply",
 )
