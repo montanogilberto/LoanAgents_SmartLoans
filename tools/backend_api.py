@@ -73,6 +73,89 @@ def get_credit_score(client_id: int, company_id: int) -> dict:
     return result.get("creditScore", {}) if isinstance(result, dict) else {}
 
 
+def get_wallet_balance(client_id: int, company_id: int) -> dict:
+    """Fetches this client's SPEI wallet balance (the real money they can lend
+    or use to pay cuotas — distinct from published capital, which is only an
+    announcement).
+
+    Args:
+        client_id: The client's clientId (borrower or lender).
+        company_id: The company scoping the wallet.
+
+    Returns:
+        {"availableBalance": float, "reservedBalance": float} or {}.
+    """
+    result = _post("/ledger/balance", {"companyId": company_id, "clientId": client_id})
+    return result if isinstance(result, dict) and "error" not in result else {}
+
+
+def get_wallet_movements(client_id: int, company_id: int) -> list[dict]:
+    """Fetches this client's wallet movement statement (deposits, loan funding,
+    repayments received, withdrawals), newest first.
+
+    Args:
+        client_id: The client's clientId.
+        company_id: The company scoping the ledger.
+
+    Returns:
+        List of ledger entries (entryType, direction, amountMXN, balanceAfter, created_At).
+    """
+    result = _post("/all_walletTransactions", {"walletTransactions": [{"companyId": company_id, "clientId": client_id}]})
+    return result.get("walletTransactions", []) if isinstance(result, dict) else []
+
+
+def get_bank_accounts(client_id: int, company_id: int) -> list[dict]:
+    """Fetches this client's linked CLABE bank accounts. The API is already
+    masked — it only ever exposes clabeLast4, never the full CLABE.
+
+    Args:
+        client_id: The client's clientId.
+        company_id: The company scoping the accounts.
+
+    Returns:
+        List of {"bankName": str, "clabeLast4": str, "isVerified": bool, "isDefault": bool}.
+    """
+    result = _post("/all_bankAccounts", {"bankAccounts": [{"companyId": company_id, "clientId": client_id}]})
+    accounts = result.get("bankAccounts", []) if isinstance(result, dict) else []
+    return [{
+        "bankName": a.get("bankName"),
+        "clabeLast4": a.get("clabeLast4"),
+        "isVerified": bool(a.get("isVerified")),
+        "isDefault": bool(a.get("isDefault")),
+    } for a in accounts]
+
+
+def get_installment_schedule(loan_id: int, company_id: int) -> list[dict]:
+    """Fetches a loan's cuota (installment) schedule: due dates, amounts,
+    principal/interest split, and paid/pending status.
+
+    Args:
+        loan_id: The loanId whose schedule to read.
+        company_id: The company scoping the loan.
+
+    Returns:
+        List of installment records.
+    """
+    result = _post("/automated-payments/schedule", {"loanId": loan_id, "companyId": company_id})
+    return result.get("installments", []) if isinstance(result, dict) else []
+
+
+def get_client_contracts(client_id: int, company_id: int) -> list[dict]:
+    """Fetches every digital contract where this client is the borrower or the
+    lender (Contrato de Crédito P2P + Pagaré metadata).
+
+    Args:
+        client_id: The client's clientId.
+        company_id: The company scoping the contracts.
+
+    Returns:
+        List of contract records (list_contracts returns a PLAIN JSON array,
+        matching the frontend's digitalContractsApi.listContractsForClient).
+    """
+    result = _post("/digitalContracts", {"contract": [{"action": "list_contracts", "companyId": company_id, "clientId": client_id}]})
+    return result if isinstance(result, list) else []
+
+
 def create_contract(
     company_id: int,
     loan_id: int,

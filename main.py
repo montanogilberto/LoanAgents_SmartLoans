@@ -25,6 +25,7 @@ from google.adk.sessions import InMemorySessionService
 from google.genai.types import Content, Part
 
 from agents import orchestrator_agent, contract_agent, id_document_agent, face_validation_agent
+from agents.support import support_agent
 from config.settings import PORT
 
 app = FastAPI(title="LoanAgents SmartLoans")
@@ -84,6 +85,7 @@ def _strip_json_fences(text: str) -> str:
 
 _session_service = InMemorySessionService()
 _negotiate_runner = Runner(agent=orchestrator_agent, app_name="loan_agents", session_service=_session_service)
+_support_runner = Runner(agent=support_agent, app_name="loan_agents_support", session_service=_session_service)
 _contract_runner = Runner(agent=contract_agent, app_name="loan_agents_contract", session_service=_session_service)
 _id_extraction_runner = Runner(agent=id_document_agent, app_name="loan_agents_id", session_service=_session_service)
 _face_validation_runner = Runner(agent=face_validation_agent, app_name="loan_agents_face", session_service=_session_service)
@@ -95,6 +97,10 @@ class NegotiateRequest(BaseModel):
     companyId: int
     message: str
     speakerRole: str = "borrower"
+    # 'account' | 'contract' | 'legal' — routes to the Support Agent (GUÍA
+    # for legal). None = free-form; lenders still get support (they never
+    # negotiate against the assistant).
+    topic: str | None = None
 
 
 class NegotiateResponse(BaseModel):
@@ -103,10 +109,46 @@ class NegotiateResponse(BaseModel):
 
 @app.post("/negotiate", response_model=NegotiateResponse)
 async def negotiate(req: NegotiateRequest) -> NegotiateResponse:
-    """Runs the full pipeline: Risk -> Recommendation -> Borrower -> Lender
-    -> Negotiation. Only the Negotiation Agent's synthesis is returned —
-    the others are intermediate reasoning steps."""
+    """Two paths share this endpoint (the backend always calls /negotiate):
+
+    - SUPPORT (a `topic` is present, or the speaker is a lender): runs the
+      single Support Agent — cuenta / contratos / legal (GUÍA). Lenders never
+      negotiate against the assistant, so they always get support.
+    - NEGOTIATION (borrower, no topic): the full pipeline Risk ->
+      Recommendation -> Borrower -> Lender -> Negotiation; only the final
+      synthesis is returned.
+    """
     user_id = f"conv-{req.conversationId}"
+    is_support = bool(req.topic) or req.speakerRole == "lender"
+
+    context = {
+        "conversationId": req.conversationId,
+        "borrowerId": req.borrowerId,
+        "companyId": req.companyId,
+        "speakerRole": req.speakerRole,
+        "topic": req.topic,
+    }
+    message = Content(
+        role="user",
+        parts=[Part(text=f"{req.message}\n\nContext: {json.dumps(context)}")],
+    )
+
+    if is_support:
+        session = await _session_service.create_session(
+            app_name="loan_agents_support",
+            user_id=user_id,
+            session_id=str(uuid.uuid4()),
+            state={"support_reply": ""},
+        )
+        async for event in _support_runner.run_async(user_id=user_id, session_id=session.id, new_message=message):
+            if event.is_final_response() and event.content:
+                pass  # final text is read from session state via output_key below
+        updated = await _session_service.get_session(app_name="loan_agents_support", user_id=user_id, session_id=session.id)
+        reply = updated.state.get("support_reply", "").strip()
+        if not reply:
+            reply = "No pude generar una respuesta en este momento. Intenta de nuevo."
+        return NegotiateResponse(reply=reply)
+
     session = await _session_service.create_session(
         app_name="loan_agents",
         user_id=user_id,
@@ -120,17 +162,6 @@ async def negotiate(req: NegotiateRequest) -> NegotiateResponse:
             "lender_position": "{}",
             "negotiation_reply": "",
         },
-    )
-
-    context = {
-        "conversationId": req.conversationId,
-        "borrowerId": req.borrowerId,
-        "companyId": req.companyId,
-        "speakerRole": req.speakerRole,
-    }
-    message = Content(
-        role="user",
-        parts=[Part(text=f"{req.message}\n\nContext: {json.dumps(context)}")],
     )
 
     async for event in _negotiate_runner.run_async(user_id=user_id, session_id=session.id, new_message=message):
