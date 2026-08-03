@@ -30,18 +30,26 @@ def get_conversation(conversation_id: int) -> dict:
 
 
 def get_client_loans(client_id: int, company_id: int) -> list[dict]:
-    """Fetches this borrower's own loans (status, amount, rate, term).
+    """Fetches the loans this client participates in — as BORROWER (loans they
+    received) or as LENDER (loans they funded; loans.clientId is always the
+    borrower, so the lender link is the 'Prestamista clientId=N' notes tag).
 
     Args:
-        client_id: The borrower's clientId.
+        client_id: The clientId (borrower or lender).
         company_id: The company scoping the loans.
 
     Returns:
-        List of loan records belonging to this client only.
+        List of loan records, each with a "myRole" field: borrower | lender.
     """
     result = _post("/all_loans", {"loans": [{"companyId": company_id}]})
     loans = result.get("loans", []) if isinstance(result, dict) else []
-    return [l for l in loans if l.get("clientId") == client_id]
+    mine = []
+    for l in loans:
+        if l.get("clientId") == client_id:
+            mine.append({**l, "myRole": "borrower"})
+        elif f"Prestamista clientId={client_id}" in (l.get("notes") or ""):
+            mine.append({**l, "myRole": "lender"})
+    return mine
 
 
 def get_client_dashboard(client_id: int, company_id: int) -> dict:
