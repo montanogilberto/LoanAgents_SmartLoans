@@ -5,8 +5,10 @@ from agents.lender import lender_agent
 from agents.negotiation import negotiation_agent
 from agents.contract import contract_agent
 from agents.orchestrator import orchestrator_agent
+from agents.analysis import analysis_agent
 from agents.id_document import id_document_agent
 from agents.face_validation import face_validation_agent
+from agents.evidence_validation import evidence_validation_agent
 
 root_agent = orchestrator_agent
 
@@ -18,7 +20,9 @@ __all__ = [
     "negotiation_agent",
     "contract_agent",
     "orchestrator_agent",
+    "analysis_agent",
     "id_document_agent",
     "face_validation_agent",
+    "evidence_validation_agent",
     "root_agent",
 ]

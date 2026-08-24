@@ -5,14 +5,21 @@ from google.adk.tools import FunctionTool
 from agents.risk.prompt import INSTRUCTION
 from tools.backend_api import get_credit_score
 
-risk_agent = Agent(
-    name="risk_agent",
-    description=(
-        "Reads a borrower's real credit score and recommends a risk tier and "
-        "interest rate adjustment — never negotiates directly, only assesses."
-    ),
-    model="gemini-2.5-flash",
-    instruction=lambda _ctx: INSTRUCTION,
-    tools=[FunctionTool(func=get_credit_score)],
-    output_key="risk_assessment",
-)
+
+def build_risk_agent() -> Agent:
+    # A fresh instance per parent — an ADK Agent can only belong to one
+    # SequentialAgent (orchestrator_agent's or analysis_agent's) at a time.
+    return Agent(
+        name="risk_agent",
+        description=(
+            "Reads a borrower's real credit score and recommends a risk tier and "
+            "interest rate adjustment — never negotiates directly, only assesses."
+        ),
+        model="gemini-2.5-flash",
+        instruction=lambda _ctx: INSTRUCTION,
+        tools=[FunctionTool(func=get_credit_score)],
+        output_key="risk_assessment",
+    )
+
+
+risk_agent = build_risk_agent()

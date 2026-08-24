@@ -24,9 +24,13 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai.types import Content, Part
 
-from agents import orchestrator_agent, contract_agent, id_document_agent, face_validation_agent
+from agents import (
+    orchestrator_agent, contract_agent, id_document_agent, face_validation_agent,
+    analysis_agent, evidence_validation_agent,
+)
 from agents.support import support_agent
 from config.settings import PORT
+from tools.backend_api import get_credit_score, get_client_loans
 
 app = FastAPI(title="LoanAgents SmartLoans")
 
@@ -89,6 +93,8 @@ _support_runner = Runner(agent=support_agent, app_name="loan_agents_support", se
 _contract_runner = Runner(agent=contract_agent, app_name="loan_agents_contract", session_service=_session_service)
 _id_extraction_runner = Runner(agent=id_document_agent, app_name="loan_agents_id", session_service=_session_service)
 _face_validation_runner = Runner(agent=face_validation_agent, app_name="loan_agents_face", session_service=_session_service)
+_analysis_runner = Runner(agent=analysis_agent, app_name="loan_agents_analysis", session_service=_session_service)
+_evidence_runner = Runner(agent=evidence_validation_agent, app_name="loan_agents_evidence", session_service=_session_service)
 
 
 class NegotiateRequest(BaseModel):
@@ -173,6 +179,101 @@ async def negotiate(req: NegotiateRequest) -> NegotiateResponse:
     if not reply:
         reply = "No pude generar una respuesta en este momento. Intenta de nuevo."
     return NegotiateResponse(reply=reply)
+
+
+class AnalyzeProposalRequest(BaseModel):
+    borrowerId: int
+    companyId: int
+    requestedAmount: float
+    requestedRate: float
+    requestedTermMonths: int
+
+
+class RiskAssessment(BaseModel):
+    score: int | None = None
+    label: str = ""
+    riskTier: str = "Unknown"
+    recommendedRate: float | None = None
+    reasoning: str = ""
+
+
+class Recommendation(BaseModel):
+    suggestedAmount: float | None = None
+    suggestedRate: float | None = None
+    suggestedTermMonths: int | None = None
+    rationale: str = ""
+
+
+class AnalyzeProposalResponse(BaseModel):
+    creditScore: dict = {}
+    loanHistory: list[dict] = []
+    riskAssessment: RiskAssessment
+    recommendation: Recommendation
+
+
+@app.post("/analyze-proposal", response_model=AnalyzeProposalResponse)
+async def analyze_proposal(req: AnalyzeProposalRequest) -> AnalyzeProposalResponse:
+    """Smart Score + suggested terms for ONE specific proposal, called by the
+    frontend before a lender accepts. Distinct from /negotiate, whose full
+    pipeline only ever returns a chat reply and discards the Risk/
+    Recommendation structured output — this runs just Risk -> Recommendation
+    (no Borrower/Lender/Negotiation synthesis) and returns it directly. The
+    raw score breakdown and loan history are fetched straight from the
+    backend, not through the LLM, since they're just data display.
+    """
+    credit_score = get_credit_score(req.borrowerId, req.companyId)
+    loan_history = get_client_loans(req.borrowerId, req.companyId)
+
+    user_id = f"analysis-{req.borrowerId}-{uuid.uuid4()}"
+    session = await _session_service.create_session(
+        app_name="loan_agents_analysis",
+        user_id=user_id,
+        session_id=str(uuid.uuid4()),
+        state={"risk_assessment": "{}", "recommendation": "{}"},
+    )
+
+    context = {
+        "borrowerId": req.borrowerId,
+        "companyId": req.companyId,
+        "requestedAmount": req.requestedAmount,
+        "requestedRate": req.requestedRate,
+        "requestedTermMonths": req.requestedTermMonths,
+    }
+    message = Content(role="user", parts=[Part(text=json.dumps(context))])
+
+    async for event in _analysis_runner.run_async(user_id=user_id, session_id=session.id, new_message=message):
+        if event.is_final_response() and event.content:
+            pass  # final text is read from session state via output_key below
+
+    updated = await _session_service.get_session(app_name="loan_agents_analysis", user_id=user_id, session_id=session.id)
+
+    def _parse(key: str) -> dict:
+        raw = updated.state.get(key, "{}")
+        try:
+            return json.loads(_strip_json_fences(raw)) if isinstance(raw, str) else raw
+        except json.JSONDecodeError:
+            return {}
+
+    risk = _parse("risk_assessment")
+    rec = _parse("recommendation")
+
+    return AnalyzeProposalResponse(
+        creditScore=credit_score,
+        loanHistory=loan_history,
+        riskAssessment=RiskAssessment(
+            score=risk.get("score"),
+            label=risk.get("label", ""),
+            riskTier=risk.get("riskTier", "Unknown"),
+            recommendedRate=risk.get("recommendedRate"),
+            reasoning=risk.get("reasoning", ""),
+        ),
+        recommendation=Recommendation(
+            suggestedAmount=rec.get("suggestedAmount"),
+            suggestedRate=rec.get("suggestedRate"),
+            suggestedTermMonths=rec.get("suggestedTermMonths"),
+            rationale=rec.get("rationale", ""),
+        ),
+    )
 
 
 class ContractRequest(BaseModel):
@@ -519,6 +620,110 @@ async def validate_face(req: ValidateFaceRequest) -> ValidateFaceResponse:
         livenessScore=float(result.get("livenessScore", 0.0) or 0.0),
         failureReasons=result.get("failureReasons", []),
         assetsEvaluated=evaluated,
+    )
+
+
+class ValidateTransferEvidenceRequest(BaseModel):
+    evidenceUrl: str | None = None
+    evidenceBase64: str | None = None
+    expectedAmountMXN: float
+    expectedTransferDate: str
+    expectedBankFrom: str | None = None
+    expectedBeneficiaryName: str
+    expectedClaveRastreo: str | None = None
+
+
+class EvidenceCheck(BaseModel):
+    name: str
+    status: str = "CANNOT_ASSESS"   # PASS | FAIL | CANNOT_ASSESS
+    detail: str = ""
+
+
+class ValidateTransferEvidenceResponse(BaseModel):
+    isValid: bool
+    confidence: float = 0.0
+    recommendedAction: str = "REVIEW_MANUALLY"   # APPROVE | REVIEW_MANUALLY | REJECT
+    overallAssessment: str = ""
+    checks: list[EvidenceCheck] = []
+    extractedAmount: str = ""
+    extractedTransferDate: str = ""
+    extractedBankFrom: str = ""
+    extractedBeneficiaryName: str = ""
+    extractedClaveRastreo: str = ""
+    mismatches: list[str] = []
+    failureReasons: list[str] = []
+
+
+@app.post("/validate-transfer-evidence", response_model=ValidateTransferEvidenceResponse)
+async def validate_transfer_evidence(req: ValidateTransferEvidenceRequest) -> ValidateTransferEvidenceResponse:
+    """Compares a comprobante photo against the DECLARED transfer details
+    (amount/date/bank/beneficiary/clave de rastreo). Advisory only — this
+    never activates a loan; the borrower's own confirmation (D5) still does
+    that. A failure here should route to manual review, not silently pass."""
+    evidence_bytes = await _resolve_image(req.evidenceUrl, req.evidenceBase64)
+    if not evidence_bytes:
+        raise HTTPException(status_code=400, detail="evidenceUrl or evidenceBase64 is required")
+
+    context = {
+        "expectedAmountMXN": req.expectedAmountMXN,
+        "expectedTransferDate": req.expectedTransferDate,
+        "expectedBankFrom": req.expectedBankFrom,
+        "expectedBeneficiaryName": req.expectedBeneficiaryName,
+        "expectedClaveRastreo": req.expectedClaveRastreo,
+    }
+    parts = [
+        Part(text=f"Context: {json.dumps(context)}"),
+        Part(text="Comprobante photo is attached below."),
+        Part.from_bytes(data=evidence_bytes, mime_type="image/jpeg"),
+    ]
+    message = Content(role="user", parts=parts)
+
+    user_id = f"evidence-{uuid.uuid4()}"
+    session = await _session_service.create_session(
+        app_name="loan_agents_evidence",
+        user_id=user_id,
+        session_id=str(uuid.uuid4()),
+        state={"transfer_evidence_result": "{}"},
+    )
+
+    async for event in _evidence_runner.run_async(user_id=user_id, session_id=session.id, new_message=message):
+        if event.is_final_response() and event.content:
+            pass  # final text is read from session state via output_key below
+
+    updated = await _session_service.get_session(app_name="loan_agents_evidence", user_id=user_id, session_id=session.id)
+    raw = updated.state.get("transfer_evidence_result", "{}")
+    try:
+        result = json.loads(_strip_json_fences(raw)) if isinstance(raw, str) else raw
+    except json.JSONDecodeError:
+        result = {}
+
+    if not result:
+        # Fail closed, same convention as /validate-face — an unusable model
+        # response must not read as a passed evidence check.
+        return ValidateTransferEvidenceResponse(
+            isValid=False,
+            recommendedAction="REVIEW_MANUALLY",
+            overallAssessment="Validation agent returned no usable result.",
+            failureReasons=["Validation agent returned no usable result."],
+        )
+
+    checks = [
+        EvidenceCheck(name=c.get("name", ""), status=str(c.get("status", "CANNOT_ASSESS")), detail=c.get("detail", ""))
+        for c in result.get("checks", []) if isinstance(c, dict)
+    ]
+    return ValidateTransferEvidenceResponse(
+        isValid=bool(result.get("isValid", False)),
+        confidence=float(result.get("confidence", 0.0) or 0.0),
+        recommendedAction=str(result.get("recommendedAction", "REVIEW_MANUALLY") or "REVIEW_MANUALLY"),
+        overallAssessment=str(result.get("overallAssessment", "") or ""),
+        checks=checks,
+        extractedAmount=str(result.get("extractedAmount", "") or ""),
+        extractedTransferDate=str(result.get("extractedTransferDate", "") or ""),
+        extractedBankFrom=str(result.get("extractedBankFrom", "") or ""),
+        extractedBeneficiaryName=str(result.get("extractedBeneficiaryName", "") or ""),
+        extractedClaveRastreo=str(result.get("extractedClaveRastreo", "") or ""),
+        mismatches=result.get("mismatches", []),
+        failureReasons=result.get("failureReasons", []),
     )
 
 
