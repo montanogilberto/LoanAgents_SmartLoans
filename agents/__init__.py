@@ -9,6 +9,11 @@ from agents.analysis import analysis_agent
 from agents.id_document import id_document_agent
 from agents.face_validation import face_validation_agent
 from agents.evidence_validation import evidence_validation_agent
+from agents.cash_register import cash_register_agent
+from agents.expense import expense_agent
+from agents.client_followup import client_followup_agent
+from agents.order_triage import order_triage_agent
+from agents.pos_clients_support import pos_clients_support_agent
 
 root_agent = orchestrator_agent
 
@@ -24,5 +29,10 @@ __all__ = [
     "id_document_agent",
     "face_validation_agent",
     "evidence_validation_agent",
+    "cash_register_agent",
+    "expense_agent",
+    "client_followup_agent",
+    "order_triage_agent",
+    "pos_clients_support_agent",
     "root_agent",
 ]

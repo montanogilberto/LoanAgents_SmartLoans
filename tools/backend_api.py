@@ -16,6 +16,21 @@ def _post(path: str, body: dict) -> dict:
     return resp.json()
 
 
+def _get(path: str) -> dict:
+    resp = httpx.get(f"{SMARTLOANS_BACKEND_URL}{path}", timeout=_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _cash_register_output(company_id: int, action: int):
+    """Shared helper for the /cashRegister action-envelope endpoint — the
+    real payload lives in result[0].output_json, per sp_cashRegister's
+    generic {value,msg,error,output_json} row shape."""
+    result = _post("/cashRegister", {"register": [{"action": action, "companyId": company_id}]})
+    rows = result.get("result", []) if isinstance(result, dict) else []
+    return rows[0].get("output_json") if rows else None
+
+
 def get_conversation(conversation_id: int) -> dict:
     """Fetches a loanChat conversation (borrower/lender ids, status, agreed terms).
 
@@ -226,3 +241,100 @@ def create_contract(
             "notes": contract_summary,
         }]
     })
+
+
+def get_cash_register_daily_summary(company_id: int) -> dict:
+    """Fetches a company's cash register daily summary (action 7): opening
+    cash, sales, deposits, withdrawals, and expected vs. physical cash
+    counted at close.
+
+    Args:
+        company_id: The company scoping the register.
+
+    Returns:
+        {"openingCash", "sales", "deposits", "withdrawals", "expectedCash",
+        "physicalCash", "difference"} or {} if no session is open/found.
+    """
+    output = _cash_register_output(company_id, action=7)
+    return output if isinstance(output, dict) else {}
+
+
+def list_cash_register_movements(company_id: int) -> list[dict]:
+    """Fetches a company's cash register movements (cash in/out) for the
+    currently open session (action 5).
+
+    Args:
+        company_id: The company scoping the register.
+
+    Returns:
+        List of movement records (movementType, amount, notes, createdAt).
+    """
+    output = _cash_register_output(company_id, action=5)
+    return output if isinstance(output, list) else []
+
+
+def get_recent_expenses(company_id: int, limit: int = 20) -> list[dict]:
+    """Fetches this company's most recent expenses. sp_expense_all returns
+    every company's expenses unscoped, so filtering by companyId happens
+    here, client-side.
+
+    Args:
+        company_id: The company to filter to.
+        limit: Max number of most-recent expenses to return.
+
+    Returns:
+        List of expense records (total, paymentMethod, paymentDate, ...),
+        most recent first.
+    """
+    result = _get("/all_expense")
+    expenses = result.get("expenses", []) if isinstance(result, dict) else []
+    mine = [e for e in expenses if e.get("companyId") == company_id]
+    mine.sort(key=lambda e: e.get("paymentDate") or "", reverse=True)
+    return mine[:limit]
+
+
+def get_client_follow_ups(client_id: int, company_id: int) -> list[dict]:
+    """Fetches this client's follow-up/collections history.
+
+    Args:
+        client_id: The clientId to filter to.
+        company_id: The company scoping the follow-ups.
+
+    Returns:
+        List of follow-up records (riskStatus, reason, note, dueDate, ...),
+        or [] if none exist.
+    """
+    result = _post("/all_clientFollowUps", {"clientFollowUps": [{"companyId": company_id, "clientId": client_id}]})
+    return result.get("clientFollowUps", []) if isinstance(result, dict) else []
+
+
+def get_one_client(client_id: int) -> dict:
+    """Fetches one client's registration record (POS "Clientes" wizard data —
+    same entity as a SmartLoans borrower, per this app's shared client table).
+    Does not take companyId: sp_clients_one's real contract only filters by
+    clientId, not scoped further.
+
+    Args:
+        client_id: The clientId to look up.
+
+    Returns:
+        The client record (first_name, last_name, cellphone, email,
+        clientType, qrBlobUrl, created_At, ...), or {} if not found.
+    """
+    result = _post("/one_clients", {"clients": [{"clientId": client_id}]})
+    clients = result.get("clients", []) if isinstance(result, dict) else []
+    return clients[0] if clients else {}
+
+
+def list_open_orders() -> list[dict]:
+    """Fetches today's orders with their current tracking status.
+    sp_orders_list is not company-scoped (it has no companyId column) and
+    only ever returns today's orders — a pre-existing backend limitation,
+    not something this tool works around.
+
+    Returns:
+        List of order records (orderId, orderNumber, tableNumber, total,
+        orderStatusName, statusChangedAt, statusNotes), most recent first.
+    """
+    result = _get("/list_orders")
+    return result.get("orders", []) if isinstance(result, dict) else []

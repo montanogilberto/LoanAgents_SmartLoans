@@ -14,6 +14,7 @@ import base64
 import json
 import time
 import uuid
+from datetime import datetime, timezone
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -26,7 +27,8 @@ from google.genai.types import Content, Part
 
 from agents import (
     orchestrator_agent, contract_agent, id_document_agent, face_validation_agent,
-    analysis_agent, evidence_validation_agent,
+    analysis_agent, evidence_validation_agent, cash_register_agent, expense_agent,
+    client_followup_agent, order_triage_agent, pos_clients_support_agent,
 )
 from agents.support import support_agent
 from config.settings import PORT
@@ -95,6 +97,11 @@ _id_extraction_runner = Runner(agent=id_document_agent, app_name="loan_agents_id
 _face_validation_runner = Runner(agent=face_validation_agent, app_name="loan_agents_face", session_service=_session_service)
 _analysis_runner = Runner(agent=analysis_agent, app_name="loan_agents_analysis", session_service=_session_service)
 _evidence_runner = Runner(agent=evidence_validation_agent, app_name="loan_agents_evidence", session_service=_session_service)
+_cash_register_runner = Runner(agent=cash_register_agent, app_name="loan_agents_cash_register", session_service=_session_service)
+_expense_runner = Runner(agent=expense_agent, app_name="loan_agents_expense", session_service=_session_service)
+_client_followup_runner = Runner(agent=client_followup_agent, app_name="loan_agents_client_followup", session_service=_session_service)
+_order_triage_runner = Runner(agent=order_triage_agent, app_name="loan_agents_order_triage", session_service=_session_service)
+_pos_clients_support_runner = Runner(agent=pos_clients_support_agent, app_name="loan_agents_pos_clients_support", session_service=_session_service)
 
 
 class NegotiateRequest(BaseModel):
@@ -725,6 +732,236 @@ async def validate_transfer_evidence(req: ValidateTransferEvidenceRequest) -> Va
         mismatches=result.get("mismatches", []),
         failureReasons=result.get("failureReasons", []),
     )
+
+
+class CashRegisterReviewRequest(BaseModel):
+    companyId: int
+
+
+class CashRegisterReviewResponse(BaseModel):
+    status: str = "unavailable"          # balanced | discrepancy | unavailable
+    differenceAmount: float = 0.0
+    severity: str = "none"               # none | minor | moderate | severe
+    explanation: str = ""
+    suggestedActions: list[str] = []
+
+
+@app.post("/cash-register/review-closeout", response_model=CashRegisterReviewResponse)
+async def review_cash_register_closeout(req: CashRegisterReviewRequest) -> CashRegisterReviewResponse:
+    """Advisory review of a company's cash register daily summary — flags
+    whether expected vs. physical cash balances. Never opens, closes, or
+    adjusts the register itself; that stays a human action in the app."""
+    user_id = f"cashregister-{req.companyId}-{uuid.uuid4()}"
+    session = await _session_service.create_session(
+        app_name="loan_agents_cash_register",
+        user_id=user_id,
+        session_id=str(uuid.uuid4()),
+        state={"cash_register_review": "{}"},
+    )
+
+    message = Content(role="user", parts=[Part(text=json.dumps({"companyId": req.companyId}))])
+    async for event in _cash_register_runner.run_async(user_id=user_id, session_id=session.id, new_message=message):
+        if event.is_final_response() and event.content:
+            pass  # final text is read from session state via output_key below
+
+    updated = await _session_service.get_session(app_name="loan_agents_cash_register", user_id=user_id, session_id=session.id)
+    raw = updated.state.get("cash_register_review", "{}")
+    try:
+        result = json.loads(_strip_json_fences(raw)) if isinstance(raw, str) else raw
+    except json.JSONDecodeError:
+        result = {}
+
+    return CashRegisterReviewResponse(
+        status=result.get("status", "unavailable"),
+        differenceAmount=float(result.get("differenceAmount", 0.0) or 0.0),
+        severity=result.get("severity", "none"),
+        explanation=result.get("explanation", ""),
+        suggestedActions=result.get("suggestedActions", []),
+    )
+
+
+class ExpenseCategorizeRequest(BaseModel):
+    companyId: int
+    description: str
+    total: float
+    paymentMethod: str = ""
+
+
+class ExpenseCategorizeResponse(BaseModel):
+    suggestedCategory: str = "Otro"
+    isAnomaly: bool = False
+    anomalyReason: str | None = None
+    confidence: float = 0.0
+
+
+@app.post("/expenses/categorize", response_model=ExpenseCategorizeResponse)
+async def categorize_expense(req: ExpenseCategorizeRequest) -> ExpenseCategorizeResponse:
+    """Suggests a category for a new expense and flags likely duplicates or
+    unusually high amounts against recent history. Advisory only — never
+    creates or edits the expense itself."""
+    user_id = f"expense-{req.companyId}-{uuid.uuid4()}"
+    session = await _session_service.create_session(
+        app_name="loan_agents_expense",
+        user_id=user_id,
+        session_id=str(uuid.uuid4()),
+        state={"expense_categorization": "{}"},
+    )
+
+    context = {
+        "companyId": req.companyId,
+        "description": req.description,
+        "total": req.total,
+        "paymentMethod": req.paymentMethod,
+    }
+    message = Content(role="user", parts=[Part(text=json.dumps(context))])
+    async for event in _expense_runner.run_async(user_id=user_id, session_id=session.id, new_message=message):
+        if event.is_final_response() and event.content:
+            pass  # final text is read from session state via output_key below
+
+    updated = await _session_service.get_session(app_name="loan_agents_expense", user_id=user_id, session_id=session.id)
+    raw = updated.state.get("expense_categorization", "{}")
+    try:
+        result = json.loads(_strip_json_fences(raw)) if isinstance(raw, str) else raw
+    except json.JSONDecodeError:
+        result = {}
+
+    return ExpenseCategorizeResponse(
+        suggestedCategory=result.get("suggestedCategory", "Otro"),
+        isAnomaly=bool(result.get("isAnomaly", False)),
+        anomalyReason=result.get("anomalyReason"),
+        confidence=float(result.get("confidence", 0.0) or 0.0),
+    )
+
+
+class ClientFollowUpSuggestionRequest(BaseModel):
+    clientId: int
+    companyId: int
+
+
+class ClientFollowUpSuggestionResponse(BaseModel):
+    suggestedAction: str = ""
+    riskStatus: str = "on_track"   # on_track | at_risk | default
+    reasoning: str = ""
+
+
+@app.post("/clients/follow-up-suggestion", response_model=ClientFollowUpSuggestionResponse)
+async def client_follow_up_suggestion(req: ClientFollowUpSuggestionRequest) -> ClientFollowUpSuggestionResponse:
+    """Suggests the next follow-up action and a risk status for one client,
+    based on their follow-up history and loan status. Advisory only — never
+    contacts the client or writes a follow-up record itself."""
+    user_id = f"followup-{req.clientId}-{uuid.uuid4()}"
+    session = await _session_service.create_session(
+        app_name="loan_agents_client_followup",
+        user_id=user_id,
+        session_id=str(uuid.uuid4()),
+        state={"client_followup_suggestion": "{}"},
+    )
+
+    context = {"clientId": req.clientId, "companyId": req.companyId}
+    message = Content(role="user", parts=[Part(text=json.dumps(context))])
+    async for event in _client_followup_runner.run_async(user_id=user_id, session_id=session.id, new_message=message):
+        if event.is_final_response() and event.content:
+            pass  # final text is read from session state via output_key below
+
+    updated = await _session_service.get_session(app_name="loan_agents_client_followup", user_id=user_id, session_id=session.id)
+    raw = updated.state.get("client_followup_suggestion", "{}")
+    try:
+        result = json.loads(_strip_json_fences(raw)) if isinstance(raw, str) else raw
+    except json.JSONDecodeError:
+        result = {}
+
+    return ClientFollowUpSuggestionResponse(
+        suggestedAction=result.get("suggestedAction", ""),
+        riskStatus=result.get("riskStatus", "on_track"),
+        reasoning=result.get("reasoning", ""),
+    )
+
+
+class PosClientsSupportRequest(BaseModel):
+    conversationId: int
+    companyId: int
+    message: str
+    clientId: int | None = None
+
+
+class PosClientsSupportResponse(BaseModel):
+    reply: str
+
+
+@app.post("/support/pos-clients", response_model=PosClientsSupportResponse)
+async def support_pos_clients(req: PosClientsSupportRequest) -> PosClientsSupportResponse:
+    """POS 'Soporte' chat, Clientes topic: helps a cashier/admin through the
+    new-client registration wizard. Advisory only — never registers, edits,
+    or deletes a client itself."""
+    user_id = f"pos-clients-support-{req.conversationId}"
+    session = await _session_service.create_session(
+        app_name="loan_agents_pos_clients_support",
+        user_id=user_id,
+        session_id=str(uuid.uuid4()),
+        state={"pos_clients_support_reply": ""},
+    )
+
+    context = {
+        "conversationId": req.conversationId,
+        "companyId": req.companyId,
+        "clientId": req.clientId,
+    }
+    message = Content(
+        role="user",
+        parts=[Part(text=f"{req.message}\n\nContext: {json.dumps(context)}")],
+    )
+    async for event in _pos_clients_support_runner.run_async(user_id=user_id, session_id=session.id, new_message=message):
+        if event.is_final_response() and event.content:
+            pass  # final text is read from session state via output_key below
+
+    updated = await _session_service.get_session(app_name="loan_agents_pos_clients_support", user_id=user_id, session_id=session.id)
+    reply = updated.state.get("pos_clients_support_reply", "").strip()
+    if not reply:
+        reply = "No pude generar una respuesta en este momento. Intenta de nuevo."
+    return PosClientsSupportResponse(reply=reply)
+
+
+class OrderStaleEntry(BaseModel):
+    orderId: int
+    status: str
+    ageMinutes: int
+
+
+class OrderTriageResponse(BaseModel):
+    summary: str = ""
+    staleOrders: list[OrderStaleEntry] = []
+
+
+@app.post("/orders/triage-summary", response_model=OrderTriageResponse)
+async def orders_triage_summary() -> OrderTriageResponse:
+    """Read-only summary of today's orders, flagging any stuck too long in a
+    non-terminal status. Never changes an order's status itself."""
+    user_id = f"ordertriage-{uuid.uuid4()}"
+    session = await _session_service.create_session(
+        app_name="loan_agents_order_triage",
+        user_id=user_id,
+        session_id=str(uuid.uuid4()),
+        state={"order_triage_result": "{}"},
+    )
+
+    context = {"nowIso": datetime.now(timezone.utc).isoformat()}
+    message = Content(role="user", parts=[Part(text=json.dumps(context))])
+    async for event in _order_triage_runner.run_async(user_id=user_id, session_id=session.id, new_message=message):
+        if event.is_final_response() and event.content:
+            pass  # final text is read from session state via output_key below
+
+    updated = await _session_service.get_session(app_name="loan_agents_order_triage", user_id=user_id, session_id=session.id)
+    raw = updated.state.get("order_triage_result", "{}")
+    try:
+        result = json.loads(_strip_json_fences(raw)) if isinstance(raw, str) else raw
+    except json.JSONDecodeError:
+        result = {}
+
+    stale = [
+        OrderStaleEntry(orderId=int(s.get("orderId", 0)), status=s.get("status", ""), ageMinutes=int(s.get("ageMinutes", 0)))
+        for s in result.get("staleOrders", []) if isinstance(s, dict)
+    ]
+    return OrderTriageResponse(summary=result.get("summary", ""), staleOrders=stale)
 
 
 @app.get("/health")
