@@ -273,6 +273,73 @@ def list_cash_register_movements(company_id: int) -> list[dict]:
     return output if isinstance(output, list) else []
 
 
+def get_monthly_income(company_id: int) -> dict:
+    """Fetches the current calendar month's income total for a company via
+    /monthly_income — a real, pre-aggregated backend value, not summed
+    client-side (unlike get_recent_expenses below, which has no equivalent
+    backend aggregate to call).
+
+    Args:
+        company_id: The company to scope to.
+
+    Returns:
+        The monthly income summary record, or {} if none returned.
+    """
+    result = _post("/monthly_income", {"income": [{"companyId": company_id}]})
+    income = result.get("income", []) if isinstance(result, dict) else []
+    return income[0] if income else {}
+
+
+def get_expense_total(company_id: int, from_date: str | None = None, to_date: str | None = None) -> dict:
+    """Sums this company's expenses over an optional date range. No backend
+    aggregate endpoint exists for expenses (unlike income's /monthly_income),
+    so this fetches /all_expense and sums client-side — same
+    fetch-then-filter pattern as get_recent_expenses, just totaled instead
+    of listed.
+
+    Args:
+        company_id: The company to filter to.
+        from_date: Optional 'YYYY-MM-DD' lower bound (inclusive) on paymentDate.
+        to_date: Optional 'YYYY-MM-DD' upper bound (inclusive) on paymentDate.
+
+    Returns:
+        {"total": float, "count": int} over the matching rows.
+    """
+    result = _get("/all_expense")
+    expenses = result.get("expenses", []) if isinstance(result, dict) else []
+    mine = [e for e in expenses if e.get("companyId") == company_id]
+    if from_date:
+        mine = [e for e in mine if (e.get("paymentDate") or "") >= from_date]
+    if to_date:
+        mine = [e for e in mine if (e.get("paymentDate") or "") <= to_date]
+    total = sum(float(e.get("total") or 0) for e in mine)
+    return {"total": total, "count": len(mine)}
+
+
+def get_trial_balance(company_id: int, to_date: str | None = None) -> dict:
+    """Fetches the real Balanza de Comprobación (trial balance) — the
+    authoritative accounting result, built from journalEntries/
+    journalEntryLines, not a client-side approximation. Income and expense
+    inserts already auto-post here (modules/journalEntries.py in the
+    backend), so this reflects real posted transactions.
+
+    Args:
+        company_id: The company to scope to.
+        to_date: Optional 'YYYY-MM-DD' cutoff — entries posted on or before
+            this date. Omit for "as of now".
+
+    Returns:
+        {"accounts": [...], "totalDebit": float, "totalCredit": float,
+        "balanced": bool} — "balanced" should always be true; false would
+        mean a real data-integrity problem worth surfacing, not hiding.
+    """
+    body: dict = {"companyId": company_id}
+    if to_date:
+        body["toDate"] = to_date
+    result = _post("/journalEntries/trial-balance", {"journalEntries": [body]})
+    return result if isinstance(result, dict) else {}
+
+
 def get_recent_expenses(company_id: int, limit: int = 20) -> list[dict]:
     """Fetches this company's most recent expenses. sp_expense_all returns
     every company's expenses unscoped, so filtering by companyId happens

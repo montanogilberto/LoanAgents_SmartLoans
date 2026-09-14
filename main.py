@@ -29,6 +29,7 @@ from agents import (
     orchestrator_agent, contract_agent, id_document_agent, face_validation_agent,
     analysis_agent, evidence_validation_agent, cash_register_agent, expense_agent,
     client_followup_agent, order_triage_agent, pos_clients_support_agent,
+    pos_income_support_agent, pos_expenses_support_agent, pos_accounting_support_agent,
 )
 from agents.support import support_agent
 from config.settings import PORT
@@ -102,6 +103,9 @@ _expense_runner = Runner(agent=expense_agent, app_name="loan_agents_expense", se
 _client_followup_runner = Runner(agent=client_followup_agent, app_name="loan_agents_client_followup", session_service=_session_service)
 _order_triage_runner = Runner(agent=order_triage_agent, app_name="loan_agents_order_triage", session_service=_session_service)
 _pos_clients_support_runner = Runner(agent=pos_clients_support_agent, app_name="loan_agents_pos_clients_support", session_service=_session_service)
+_pos_income_support_runner = Runner(agent=pos_income_support_agent, app_name="loan_agents_pos_income_support", session_service=_session_service)
+_pos_expenses_support_runner = Runner(agent=pos_expenses_support_agent, app_name="loan_agents_pos_expenses_support", session_service=_session_service)
+_pos_accounting_support_runner = Runner(agent=pos_accounting_support_agent, app_name="loan_agents_pos_accounting_support", session_service=_session_service)
 
 
 class NegotiateRequest(BaseModel):
@@ -884,15 +888,24 @@ class PosClientsSupportRequest(BaseModel):
     clientId: int | None = None
 
 
+class PendingAction(BaseModel):
+    capability: str
+    fields: dict
+    confirmationSummary: str
+
+
 class PosClientsSupportResponse(BaseModel):
     reply: str
+    pendingAction: PendingAction | None = None
 
 
 @app.post("/support/pos-clients", response_model=PosClientsSupportResponse)
 async def support_pos_clients(req: PosClientsSupportRequest) -> PosClientsSupportResponse:
     """POS 'Soporte' chat, Clientes topic: helps a cashier/admin through the
-    new-client registration wizard. Advisory only — never registers, edits,
-    or deletes a client itself."""
+    new-client registration wizard, and can PROPOSE creating a client when
+    the message already gives every required field (see
+    agents/pos_clients_support/prompt.py). Never executes the write itself —
+    that's the backend's job, only after explicit confirmation."""
     user_id = f"pos-clients-support-{req.conversationId}"
     session = await _session_service.create_session(
         app_name="loan_agents_pos_clients_support",
@@ -918,7 +931,116 @@ async def support_pos_clients(req: PosClientsSupportRequest) -> PosClientsSuppor
     reply = updated.state.get("pos_clients_support_reply", "").strip()
     if not reply:
         reply = "No pude generar una respuesta en este momento. Intenta de nuevo."
-    return PosClientsSupportResponse(reply=reply)
+
+    # propose_action (tools/pending_actions.py) writes here during THIS same
+    # invocation, before this in-memory session is ever discarded — no
+    # cross-request session persistence needed for this to work.
+    pending_raw = updated.state.get("pending_action")
+    pending_action = PendingAction(**pending_raw) if isinstance(pending_raw, dict) else None
+
+    return PosClientsSupportResponse(reply=reply, pendingAction=pending_action)
+
+
+class PosIncomeSupportRequest(BaseModel):
+    conversationId: int
+    companyId: int
+    message: str
+
+
+class PosIncomeSupportResponse(BaseModel):
+    reply: str
+
+
+@app.post("/support/pos-income", response_model=PosIncomeSupportResponse)
+async def support_pos_income(req: PosIncomeSupportRequest) -> PosIncomeSupportResponse:
+    """POS 'Soporte' chat, Income topic: explains recorded income using real
+    data. Advisory only — never creates or edits an income record itself."""
+    user_id = f"pos-income-support-{req.conversationId}"
+    session = await _session_service.create_session(
+        app_name="loan_agents_pos_income_support",
+        user_id=user_id,
+        session_id=str(uuid.uuid4()),
+        state={"pos_income_support_reply": ""},
+    )
+    context = {"conversationId": req.conversationId, "companyId": req.companyId}
+    message = Content(role="user", parts=[Part(text=f"{req.message}\n\nContext: {json.dumps(context)}")])
+    async for event in _pos_income_support_runner.run_async(user_id=user_id, session_id=session.id, new_message=message):
+        if event.is_final_response() and event.content:
+            pass
+
+    updated = await _session_service.get_session(app_name="loan_agents_pos_income_support", user_id=user_id, session_id=session.id)
+    reply = updated.state.get("pos_income_support_reply", "").strip()
+    if not reply:
+        reply = "No pude generar una respuesta en este momento. Intenta de nuevo."
+    return PosIncomeSupportResponse(reply=reply)
+
+
+class PosExpensesSupportRequest(BaseModel):
+    conversationId: int
+    companyId: int
+    message: str
+
+
+class PosExpensesSupportResponse(BaseModel):
+    reply: str
+
+
+@app.post("/support/pos-expenses", response_model=PosExpensesSupportResponse)
+async def support_pos_expenses(req: PosExpensesSupportRequest) -> PosExpensesSupportResponse:
+    """POS 'Soporte' chat, Expenses topic: explains recorded expenses using
+    real data. Advisory only — never creates or edits an expense record itself."""
+    user_id = f"pos-expenses-support-{req.conversationId}"
+    session = await _session_service.create_session(
+        app_name="loan_agents_pos_expenses_support",
+        user_id=user_id,
+        session_id=str(uuid.uuid4()),
+        state={"pos_expenses_support_reply": ""},
+    )
+    context = {"conversationId": req.conversationId, "companyId": req.companyId}
+    message = Content(role="user", parts=[Part(text=f"{req.message}\n\nContext: {json.dumps(context)}")])
+    async for event in _pos_expenses_support_runner.run_async(user_id=user_id, session_id=session.id, new_message=message):
+        if event.is_final_response() and event.content:
+            pass
+
+    updated = await _session_service.get_session(app_name="loan_agents_pos_expenses_support", user_id=user_id, session_id=session.id)
+    reply = updated.state.get("pos_expenses_support_reply", "").strip()
+    if not reply:
+        reply = "No pude generar una respuesta en este momento. Intenta de nuevo."
+    return PosExpensesSupportResponse(reply=reply)
+
+
+class PosAccountingSupportRequest(BaseModel):
+    conversationId: int
+    companyId: int
+    message: str
+
+
+class PosAccountingSupportResponse(BaseModel):
+    reply: str
+
+
+@app.post("/support/pos-accounting", response_model=PosAccountingSupportResponse)
+async def support_pos_accounting(req: PosAccountingSupportRequest) -> PosAccountingSupportResponse:
+    """POS 'Soporte' chat, Accounting topic: explains the real trial balance.
+    Advisory only — never posts, edits, or voids a journal entry itself."""
+    user_id = f"pos-accounting-support-{req.conversationId}"
+    session = await _session_service.create_session(
+        app_name="loan_agents_pos_accounting_support",
+        user_id=user_id,
+        session_id=str(uuid.uuid4()),
+        state={"pos_accounting_support_reply": ""},
+    )
+    context = {"conversationId": req.conversationId, "companyId": req.companyId}
+    message = Content(role="user", parts=[Part(text=f"{req.message}\n\nContext: {json.dumps(context)}")])
+    async for event in _pos_accounting_support_runner.run_async(user_id=user_id, session_id=session.id, new_message=message):
+        if event.is_final_response() and event.content:
+            pass
+
+    updated = await _session_service.get_session(app_name="loan_agents_pos_accounting_support", user_id=user_id, session_id=session.id)
+    reply = updated.state.get("pos_accounting_support_reply", "").strip()
+    if not reply:
+        reply = "No pude generar una respuesta en este momento. Intenta de nuevo."
+    return PosAccountingSupportResponse(reply=reply)
 
 
 class OrderStaleEntry(BaseModel):
