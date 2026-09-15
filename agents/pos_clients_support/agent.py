@@ -4,7 +4,7 @@ from google.adk.tools import FunctionTool
 
 from agents.pos_clients_support.prompt import INSTRUCTION
 from retrieval.graph import describe_schema
-from retrieval.keyword_search import search_docs
+from retrieval.hybrid import hybrid_search
 from tools.backend_api import (
     get_one_client, list_clients, get_reward_balance, get_reward_transactions,
     resolve_income_receipt,
@@ -33,7 +33,7 @@ pos_clients_support_agent = Agent(
         FunctionTool(func=get_reward_balance),
         FunctionTool(func=get_reward_transactions),
         FunctionTool(func=resolve_income_receipt),
-        FunctionTool(func=search_docs),
+        FunctionTool(func=hybrid_search),
         FunctionTool(func=propose_action),
     ],
     output_key="pos_clients_support_reply",

@@ -56,10 +56,11 @@ only propose the two SIMPLE expense types — never 'inventory'
   expenses (total, paymentMethod, paymentDate). Use this when the cashier
   wants to see specific entries, not just a total.
 
-## Conceptual "how/why" questions (search_docs tool)
+## Conceptual "how/why" questions (hybrid_search tool)
 For questions about how something works rather than a specific figure,
-call search_docs(query) — searches real backend API documentation. If
-nothing relevant comes back, say so — don't guess.
+call hybrid_search(query) — combines keyword and semantic search over
+real backend API documentation. If nothing relevant comes back, say so —
+don't guess.
 
 ## Rules
 - Never state a peso amount or count you did not get from a tool call in

@@ -16,11 +16,14 @@ smartloans_backend's DB, 2026-09-15) before being added here — this file
 should never describe an aspirational relationship, only a real one.
 
 Deliberately NOT named/scoped as "pos_graph" or anything POS-specific —
-per the architecture discussion, this is meant to be the first shared
-piece of a GMO-wide retrieval layer, with the POS support agents as its
-first real consumer (see agents/pos_clients_support/). A future factory
-consumer (posgmo-factory/debate_v2) would import GRAPH_SCHEMA the same
-way — the contract doesn't change per-consumer, only who calls it.
+this is meant to be a shared piece of THIS repo's (LoanAgents_SmartLoans)
+retrieval layer, with the POS support agents as its consumer (see
+agents/pos_clients_support/). This is scoped to runtime/domain agents
+that answer questions using live data — it is NOT the "System Truth"
+layer for Agent_POSGMO/posgmo-factory (the separate software-factory
+repo that generates code/SQL/PRs). That repo has its own, independent
+schema intelligence (schema_analyst_agent, querying the live SQL Server
+directly via MCP) and does not consume this module.
 
 Usage: an agent does NOT call functions in this file directly as tools —
 ADK's own function-calling loop already lets an LLM chain multiple

@@ -3,7 +3,7 @@ from google.adk.agents import Agent
 from google.adk.tools import FunctionTool
 
 from agents.pos_income_support.prompt import INSTRUCTION
-from retrieval.keyword_search import search_docs
+from retrieval.hybrid import hybrid_search
 from tools.backend_api import get_monthly_income
 from tools.pending_actions import propose_action
 
@@ -20,7 +20,7 @@ pos_income_support_agent = Agent(
     instruction=lambda _ctx: INSTRUCTION,
     tools=[
         FunctionTool(func=get_monthly_income),
-        FunctionTool(func=search_docs),
+        FunctionTool(func=hybrid_search),
         FunctionTool(func=propose_action),
     ],
     output_key="pos_income_support_reply",

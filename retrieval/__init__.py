@@ -12,19 +12,28 @@ Graph Traversal | Semantic Retrieval -> Connected Context" diagram:
 - Graph traversal — retrieval/graph.py's GRAPH_SCHEMA: a declarative,
   verified-against-the-live-DB list of entity relationships (client ->
   reward_transactions -> originating_sale -> income_receipt, ...).
-- Keyword (lexical) retrieval — retrieval/keyword_search.py's
-  search_docs(): searches the backend's own live OpenAPI docs (sourced
-  from docs_description/*.txt) for conceptual "how/why" questions that
-  have no specific entity to resolve. Deliberately lexical-only, no
-  embeddings — see that module's docstring for why, and for its real,
-  demonstrated precision limits (exact-term matching, no cross-language
-  understanding).
+- Hybrid (lexical + semantic) retrieval — for conceptual "how/why"
+  questions with no specific entity to resolve. Three cooperating
+  modules, wired together by hybrid.py's hybrid_search() (the ONE
+  function actually exposed to agents as a tool):
+    - keyword_search.py — lexical/exact-term matching over the backend's
+      live OpenAPI docs (sourced from docs_description/*.txt).
+    - query_expansion.py — a small, real Spanish<->English domain
+      glossary that widens the lexical query (added after live testing
+      showed "crear cliente" missing /clients entirely — see that
+      module's docstring for the exact failure case it fixes).
+    - semantic_search.py — Gemini embedding similarity over the same doc
+      corpus, catching conceptual matches keyword search can't.
+    - rerank.py — Reciprocal Rank Fusion, combining both pillars' ranked
+      lists into one.
 
-There is no fourth "unifying dispatcher" class here on purpose — ADK's
-own agent already IS the retrieval controller (Section 2.4/5.6 of the
-architecture discussion: "the agent decides what information it needs").
-An agent is handed tools from all three pillars and its prompt explains
-when each applies; the LLM's own reasoning is the "reusable interface,"
-not a hand-rolled router. Building one would be exactly the "giant
-platform" the architecture discussion says to avoid.
+There is no fourth "unifying dispatcher" class across ALL pillars on
+purpose — ADK's own agent already IS the retrieval controller (Section
+2.4/5.6 of the architecture discussion: "the agent decides what
+information it needs"). An agent is handed structured/graph/hybrid tools
+and its prompt explains when each applies; the LLM's own reasoning is the
+"reusable interface," not a hand-rolled router. hybrid.py's internal
+fusion of keyword+semantic is a real exception to that — those two are
+fused BEFORE the agent sees them because ranking-then-combining is a
+mechanical step, not a judgment call the LLM needs to make.
 """

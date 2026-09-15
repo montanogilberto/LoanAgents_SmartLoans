@@ -3,11 +3,23 @@ Calls into smartloans_backend's public REST API — this repo never touches
 the database or imports backend Python modules directly, per the
 independent-repo/API-only architecture.
 """
+from datetime import datetime, timedelta, timezone
+
 import httpx
 
 from config.settings import SMARTLOANS_BACKEND_URL
 
 _TIMEOUT = 15.0
+
+# UTC-7, no DST -- same convention as POSVending's
+# src/utils/format.ts::toHermosilloDate, kept in sync deliberately so
+# "today" means the same calendar day on both sides of the chat.
+_HERMOSILLO_OFFSET = timedelta(hours=7)
+
+
+def _to_hermosillo(iso: str) -> datetime:
+    s = iso if ("+" in iso[10:] or iso.endswith("Z")) else iso + "Z"
+    return datetime.fromisoformat(s.replace("Z", "+00:00")) - _HERMOSILLO_OFFSET
 
 
 def _post(path: str, body: dict) -> dict:
@@ -274,20 +286,47 @@ def list_cash_register_movements(company_id: int) -> list[dict]:
 
 
 def get_monthly_income(company_id: int) -> dict:
-    """Fetches the current calendar month's income total for a company via
-    /monthly_income — a real, pre-aggregated backend value, not summed
-    client-side (unlike get_recent_expenses below, which has no equivalent
-    backend aggregate to call).
+    """Fetches this calendar month's income and aggregates it.
+
+    /monthly_income does NOT return a pre-aggregated summary row — it
+    returns every individual transaction for the month (verified
+    2026-09-15: 65 rows for one real company). A previous version of this
+    function assumed otherwise and returned income[0] -- one arbitrary
+    transaction mislabeled as "the" figure, which is why the income
+    support agent was reporting "no data" even when real income existed:
+    it correctly distrusted a single transaction row as a monthly total
+    and refused to guess. Aggregating client-side here, the same pattern
+    get_expense_total already uses for expenses, fixes that.
 
     Args:
         company_id: The company to scope to.
 
     Returns:
-        The monthly income summary record, or {} if none returned.
+        {"companyId", "monthlyTotal", "monthlyCount", "todayTotal",
+        "todayCount"} -- monthly figures cover every returned row; today's
+        are the subset whose paymentDate falls on today's date in
+        Hermosillo local time (UTC-7, no DST) -- the same "Ventas Hoy"
+        the POS dashboard itself computes.
     """
     result = _post("/monthly_income", {"income": [{"companyId": company_id}]})
-    income = result.get("income", []) if isinstance(result, dict) else []
-    return income[0] if income else {}
+    rows = result.get("income", []) if isinstance(result, dict) else []
+    if not rows:
+        return {"companyId": company_id, "monthlyTotal": 0.0, "monthlyCount": 0,
+                "todayTotal": 0.0, "todayCount": 0}
+
+    def _net(row: dict) -> float:
+        return float(row.get("total") or 0) - float(row.get("discountAmount") or 0)
+
+    today = (datetime.now(timezone.utc) - _HERMOSILLO_OFFSET).date()
+    today_rows = [r for r in rows if _to_hermosillo(r["paymentDate"]).date() == today]
+
+    return {
+        "companyId": company_id,
+        "monthlyTotal": round(sum(_net(r) for r in rows), 2),
+        "monthlyCount": len(rows),
+        "todayTotal": round(sum(_net(r) for r in today_rows), 2),
+        "todayCount": len(today_rows),
+    }
 
 
 def get_expense_total(company_id: int, from_date: str | None = None, to_date: str | None = None) -> dict:

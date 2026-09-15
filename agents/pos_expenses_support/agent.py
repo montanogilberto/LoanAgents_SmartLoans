@@ -8,7 +8,7 @@ from google.adk.agents import Agent
 from google.adk.tools import FunctionTool
 
 from agents.pos_expenses_support.prompt import INSTRUCTION
-from retrieval.keyword_search import search_docs
+from retrieval.hybrid import hybrid_search
 from tools.backend_api import get_expense_total, get_recent_expenses
 from tools.pending_actions import propose_action
 
@@ -26,7 +26,7 @@ pos_expenses_support_agent = Agent(
     tools=[
         FunctionTool(func=get_expense_total),
         FunctionTool(func=get_recent_expenses),
-        FunctionTool(func=search_docs),
+        FunctionTool(func=hybrid_search),
         FunctionTool(func=propose_action),
     ],
     output_key="pos_expenses_support_reply",
