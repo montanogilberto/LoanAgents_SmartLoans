@@ -1,13 +1,12 @@
 """
 Shared helper for POS support agents that need to PROPOSE a write action,
-not just explain. Because each /support/pos-* call is a fresh, stateless
-ADK session (see main.py — session_id=uuid4() every time), an agent has no
-memory across turns; it can only see the user's single latest message. So
-a write action can only be proposed when that one message already contains
-everything required — there is no multi-turn "gather info, then propose"
-flow with the current wiring (a real limitation, not a design choice; the
-fix would be injecting conversation history into each call, which touches
-every topic and is a separate piece of work).
+not just explain. Each /support/pos-* call reuses the SAME ADK session for
+a given (topic, conversationId) — see main.py's _get_or_create_pos_session
+— so the agent DOES see prior turns of this conversation and can gather
+required fields across several messages before proposing (e.g. ask for the
+product, then the payment method, then propose). Only a server restart
+(in-memory session store) or a "clear history"/new-conversation action
+resets this.
 
 The tool writes the proposal into ToolContext.state, NOT anywhere durable —
 main.py reads it back from the SAME invocation's final session state
@@ -16,10 +15,20 @@ discarded) and returns it to the backend as `pendingAction`. The backend
 (smartloans_backend/modules/posSupportChat.py) is what actually persists
 it (in-process, with a TTL) and is the ONLY place that ever executes the
 real write — this tool never calls the backend itself.
+
+Before writing the proposal, `fields` is checked against
+retrieval/contracts.py's CONTRACTS for this capability — the
+machine-readable version of the required-field rules each agent's prompt
+states in prose. This exists because an LLM occasionally drifts from its
+own prompt (a missing digit, a made-up clientType); catching that here
+surfaces it to the cashier in the SAME turn instead of one round-trip
+later, after they've already confirmed, as a backend error.
 """
 from __future__ import annotations
 
 from google.adk.tools import ToolContext
+
+from retrieval.contracts import CONTRACTS
 
 
 def propose_action(capability: str, fields: dict, confirmation_summary: str, tool_context: ToolContext) -> dict:
@@ -35,8 +44,18 @@ def propose_action(capability: str, fields: dict, confirmation_summary: str, too
             them as your reply).
 
     Returns:
-        {"proposed": true} — always; this tool cannot fail.
+        {"proposed": true} on success.
+        {"proposed": false, "errors": [...]} if `fields` fails the
+        capability's contract (retrieval/contracts.py) — when this happens,
+        do NOT tell the user it was proposed; ask them for a corrected value
+        for whichever field the error names, then call this tool again.
     """
+    contract = CONTRACTS.get(capability)
+    if contract is not None:
+        errors = contract.validate(fields)
+        if errors:
+            return {"proposed": False, "errors": errors}
+
     tool_context.state["pending_action"] = {
         "capability": capability,
         "fields": fields,

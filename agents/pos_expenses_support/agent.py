@@ -8,20 +8,26 @@ from google.adk.agents import Agent
 from google.adk.tools import FunctionTool
 
 from agents.pos_expenses_support.prompt import INSTRUCTION
+from retrieval.keyword_search import search_docs
 from tools.backend_api import get_expense_total, get_recent_expenses
+from tools.pending_actions import propose_action
 
 pos_expenses_support_agent = Agent(
     name="pos_expenses_support_agent",
     description=(
         "Chat assistant for POS cashiers/admins asking about recorded expenses — "
-        "explains real expense totals and recent entries, never invents a number, "
-        "and never creates or edits an expense record itself."
+        "explains real expense totals and recent entries, and can PROPOSE "
+        "registering a new general/payroll expense when the cashier's message "
+        "already gives every required field (never executes the write itself — "
+        "the backend does that only after explicit confirmation)."
     ),
     model="gemini-2.5-flash",
     instruction=lambda _ctx: INSTRUCTION,
     tools=[
         FunctionTool(func=get_expense_total),
         FunctionTool(func=get_recent_expenses),
+        FunctionTool(func=search_docs),
+        FunctionTool(func=propose_action),
     ],
     output_key="pos_expenses_support_reply",
 )

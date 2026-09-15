@@ -375,6 +375,111 @@ def get_client_follow_ups(client_id: int, company_id: int) -> list[dict]:
     return result.get("clientFollowUps", []) if isinstance(result, dict) else []
 
 
+def list_clients(company_id: int, limit: int = 20, name_contains: str | None = None) -> list[dict]:
+    """Fetches this company's clients. sp_clients_all returns every
+    company's clients unscoped (no companyId parameter), so filtering by
+    companyId happens here, client-side — same fetch-then-filter pattern
+    already used by get_recent_expenses/get_expense_total for sp_expense_all.
+    This function is the trust boundary: only the filtered subset for
+    company_id is ever returned to the caller (the agent, then the chat
+    reply) — the unscoped full list never leaves this function.
+
+    Args:
+        company_id: The company to filter to.
+        limit: Max number of most-recently-created clients to return.
+        name_contains: Optional case-insensitive substring filter on
+            "first_name last_name" (for "busca un cliente llamado ..."
+            style questions). Omit to just list recent clients.
+
+    Returns:
+        List of client records (clientId, first_name, last_name, cellphone,
+        email, clientType, created_At), most recently created first.
+    """
+    result = _get("/all_clients")
+    clients = result.get("clients", []) if isinstance(result, dict) else []
+    mine = [c for c in clients if c.get("companyId") == company_id]
+    if name_contains:
+        needle = name_contains.strip().lower()
+        mine = [
+            c for c in mine
+            if needle in f"{c.get('first_name', '')} {c.get('last_name', '')}".strip().lower()
+        ]
+    mine.sort(key=lambda c: c.get("created_At") or "", reverse=True)
+    return mine[:limit]
+
+
+def get_reward_balance(company_id: int, client_id: int) -> dict:
+    """Fetches a client's real loyalty-points balance via sp_rewards'
+    get_balance action (the live rewardPoints table — see
+    smartloans_backend/modules/rewards.py). First hop in the GMO
+    relationship graph's client -> reward_balance edge (retrieval/graph.py).
+
+    Args:
+        company_id: The company scoping the balance.
+        client_id: The client to look up.
+
+    Returns:
+        {"balance": int, "lifetimeEarned": int, "lifetimeRedeemed": int,
+        "lastActivity": str|None}, or zeros if the client has no wallet row yet.
+    """
+    result = _post("/rewards", {"rewards": [
+        {"action": "get_balance", "companyId": company_id, "clientId": client_id}
+    ]})
+    return result if isinstance(result, dict) else {}
+
+
+def get_reward_transactions(company_id: int, client_id: int, limit: int = 20) -> list[dict]:
+    """Fetches a client's real loyalty-points ledger (earn/redeem history)
+    via sp_rewards' list_transactions action. Second hop in the GMO
+    relationship graph's client -> reward_transactions edge
+    (retrieval/graph.py) — each row's referenceId is the incomeId of the
+    sale that earned it (only populated for transactions created after the
+    2026-09-15 fix wiring modules.rewards.earn_points_for_income into
+    income_sp — older/seed transactions may have a non-numeric or missing
+    referenceId, meaning no sale is linked).
+
+    Args:
+        company_id: The company scoping the ledger.
+        client_id: The client to look up.
+        limit: Max number of most-recent transactions to return (the SP
+            itself caps at 50; this trims further client-side).
+
+    Returns:
+        List of {txId, txType, points, balanceAfter, referenceId,
+        description, created_At}, most recent first.
+    """
+    result = _post("/rewards", {"rewards": [
+        {"action": "list_transactions", "companyId": company_id, "clientId": client_id}
+    ]})
+    txns = result if isinstance(result, list) else []
+    return txns[:limit]
+
+
+def resolve_income_receipt(income_id: int) -> dict:
+    """Resolves ONE income/sale to its full receipt: the income header,
+    the client who bought it, the cashier, every product line (with
+    options), computed totals, and ticket/printing metadata — all in one
+    already-existing backend call (sp_tickets_one does this exact join
+    server-side, see smartloans_backend/sql — verified live 2026-09-15).
+    This is the graph edge reward_transaction -> income in
+    retrieval/graph.py: given a referenceId from a reward transaction,
+    this turns it into the real sale that earned/spent those points.
+
+    Args:
+        income_id: The incomeId to resolve (e.g. from a reward
+            transaction's referenceId, once converted to int).
+
+    Returns:
+        {"incomeId", "companyId", "paymentDate", "paymentMethod",
+        "client": {...}, "user": {...}, "products": [...],
+        "totals": {...}, "ticketMeta": {...}}, or {} if not found /
+        referenceId didn't point to a real income row.
+    """
+    result = _post("/one_tickets", {"tickets": [{"income": income_id}]})
+    tickets = result.get("tickets", []) if isinstance(result, dict) else []
+    return tickets[0] if tickets else {}
+
+
 def get_one_client(client_id: int) -> dict:
     """Fetches one client's registration record (POS "Clientes" wizard data —
     same entity as a SmartLoans borrower, per this app's shared client table).

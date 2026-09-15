@@ -9,6 +9,7 @@ from google.adk.agents import Agent
 from google.adk.tools import FunctionTool
 
 from agents.pos_accounting_support.prompt import INSTRUCTION
+from retrieval.keyword_search import search_docs
 from tools.backend_api import get_trial_balance
 
 pos_accounting_support_agent = Agent(
@@ -22,6 +23,7 @@ pos_accounting_support_agent = Agent(
     instruction=lambda _ctx: INSTRUCTION,
     tools=[
         FunctionTool(func=get_trial_balance),
+        FunctionTool(func=search_docs),
     ],
     output_key="pos_accounting_support_reply",
 )
