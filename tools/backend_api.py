@@ -303,22 +303,36 @@ def get_monthly_income(company_id: int) -> dict:
 
     Returns:
         {"companyId", "monthlyTotal", "monthlyCount", "todayTotal",
-        "todayCount"} -- monthly figures cover every returned row; today's
-        are the subset whose paymentDate falls on today's date in
-        Hermosillo local time (UTC-7, no DST) -- the same "Ventas Hoy"
-        the POS dashboard itself computes.
+        "todayCount", "yesterdayTotal", "yesterdayCount",
+        "yesterdayInPreviousMonth"} -- monthly figures cover every returned
+        row; today's/yesterday's are the subset whose paymentDate falls on
+        that date in Hermosillo local time (UTC-7, no DST) -- the same
+        "Ventas Hoy" the POS dashboard itself computes. If yesterday was the
+        last day of the PREVIOUS calendar month, this endpoint has no data
+        for it (it only ever returns the current month) --
+        yesterdayInPreviousMonth is True and yesterdayTotal/yesterdayCount
+        are None in that one case, rather than a misleading 0.
     """
     result = _post("/monthly_income", {"income": [{"companyId": company_id}]})
     rows = result.get("income", []) if isinstance(result, dict) else []
+    today = (datetime.now(timezone.utc) - _HERMOSILLO_OFFSET).date()
+    yesterday = today - timedelta(days=1)
+    yesterday_in_previous_month = yesterday.month != today.month
+
     if not rows:
-        return {"companyId": company_id, "monthlyTotal": 0.0, "monthlyCount": 0,
-                "todayTotal": 0.0, "todayCount": 0}
+        return {
+            "companyId": company_id, "monthlyTotal": 0.0, "monthlyCount": 0,
+            "todayTotal": 0.0, "todayCount": 0,
+            "yesterdayTotal": None if yesterday_in_previous_month else 0.0,
+            "yesterdayCount": None if yesterday_in_previous_month else 0,
+            "yesterdayInPreviousMonth": yesterday_in_previous_month,
+        }
 
     def _net(row: dict) -> float:
         return float(row.get("total") or 0) - float(row.get("discountAmount") or 0)
 
-    today = (datetime.now(timezone.utc) - _HERMOSILLO_OFFSET).date()
     today_rows = [r for r in rows if _to_hermosillo(r["paymentDate"]).date() == today]
+    yesterday_rows = [r for r in rows if _to_hermosillo(r["paymentDate"]).date() == yesterday]
 
     return {
         "companyId": company_id,
@@ -326,6 +340,9 @@ def get_monthly_income(company_id: int) -> dict:
         "monthlyCount": len(rows),
         "todayTotal": round(sum(_net(r) for r in today_rows), 2),
         "todayCount": len(today_rows),
+        "yesterdayTotal": None if yesterday_in_previous_month else round(sum(_net(r) for r in yesterday_rows), 2),
+        "yesterdayCount": None if yesterday_in_previous_month else len(yesterday_rows),
+        "yesterdayInPreviousMonth": yesterday_in_previous_month,
     }
 
 

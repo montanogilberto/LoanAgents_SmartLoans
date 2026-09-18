@@ -23,6 +23,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Union
 
+# Fields that must NEVER be accepted from agent-supplied `fields` for ANY
+# capability, regardless of what a given prompt says. smartloans_backend's
+# _execute_pending_action (modules/posSupportChat.py) sets companyId/userId
+# itself from the server-side pending record (the authenticated request
+# that created the proposal) -- never from the LLM. If an agent's fields
+# dict ever carried these, a dict-merge ordering slip in that executor
+# could let an LLM-controlled value silently override the trusted one --
+# e.g. writing an income record into the wrong company's ledger. Rejecting
+# them here, at proposal time, means that class of bug can never reach the
+# executor in the first place, no matter what a future prompt asks the
+# agent to include. See agents/pos_income_support/prompt.py's "Creating an
+# income record directly" section for the cashier-facing rule this backs.
+_RESERVED_KEYS = frozenset({"companyId", "userId"})
+
 
 @dataclass(frozen=True)
 class FieldSpec:
@@ -35,6 +49,7 @@ class FieldSpec:
     enum: tuple[str, ...] | None = None
     min_digits: int | None = None   # count of digits in the value, e.g. a phone number
     min_value: float | None = None  # inclusive lower bound for int/float
+    min_items: int | None = None    # inclusive lower bound for list length
 
     def is_required(self, fields: dict) -> bool:
         return self.required(fields) if callable(self.required) else self.required
@@ -64,6 +79,8 @@ class FieldSpec:
                 return f"{self.name} must contain at least {self.min_digits} digits, got {value!r}"
         if self.min_value is not None and isinstance(value, (int, float)) and value < self.min_value:
             return f"{self.name} must be >= {self.min_value}, got {value!r}"
+        if self.min_items is not None and isinstance(value, list) and len(value) < self.min_items:
+            return f"{self.name} must have at least {self.min_items} item(s), got {value!r}"
         return None
 
 
@@ -75,6 +92,12 @@ class Contract:
 
     def validate(self, fields: dict) -> list[str]:
         errors = []
+        reserved_present = _RESERVED_KEYS & fields.keys()
+        for key in sorted(reserved_present):
+            errors.append(
+                f"{key} must not be included in fields -- it is attached "
+                f"server-side from the authenticated request, never from the agent"
+            )
         for spec in self.fields:
             error = spec.check(fields)
             if error:
@@ -104,7 +127,7 @@ CONTRACTS: dict[str, Contract] = {
             FieldSpec("total", float, required=True, min_value=0.01),
             FieldSpec("paymentMethod", str, required=True),
             FieldSpec("clientId", int, required=True, min_value=1),
-            FieldSpec("products", list, required=False),
+            FieldSpec("products", list, required=True, min_items=1),
             FieldSpec("paymentDate", str, required=False),
             FieldSpec("orderId", int, required=False),
         ),
