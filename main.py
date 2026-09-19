@@ -30,6 +30,7 @@ from agents import (
     analysis_agent, evidence_validation_agent, cash_register_agent, expense_agent,
     client_followup_agent, order_triage_agent, pos_clients_support_agent,
     pos_income_support_agent, pos_expenses_support_agent, pos_accounting_support_agent,
+    pos_rewards_support_agent,
 )
 from agents.support import support_agent
 from config.settings import PORT
@@ -126,6 +127,7 @@ _pos_clients_support_runner = Runner(agent=pos_clients_support_agent, app_name="
 _pos_income_support_runner = Runner(agent=pos_income_support_agent, app_name="loan_agents_pos_income_support", session_service=_session_service)
 _pos_expenses_support_runner = Runner(agent=pos_expenses_support_agent, app_name="loan_agents_pos_expenses_support", session_service=_session_service)
 _pos_accounting_support_runner = Runner(agent=pos_accounting_support_agent, app_name="loan_agents_pos_accounting_support", session_service=_session_service)
+_pos_rewards_support_runner = Runner(agent=pos_rewards_support_agent, app_name="loan_agents_pos_rewards_support", session_service=_session_service)
 
 
 class NegotiateRequest(BaseModel):
@@ -1071,6 +1073,42 @@ async def support_pos_accounting(req: PosAccountingSupportRequest) -> PosAccount
     if not reply:
         reply = "No pude generar una respuesta en este momento. Intenta de nuevo."
     return PosAccountingSupportResponse(reply=reply)
+
+
+class PosRewardsSupportRequest(BaseModel):
+    conversationId: int
+    companyId: int
+    message: str
+    clientId: int | None = None
+
+
+class PosRewardsSupportResponse(BaseModel):
+    reply: str
+
+
+@app.post("/support/pos-rewards", response_model=PosRewardsSupportResponse)
+async def support_pos_rewards(req: PosRewardsSupportRequest) -> PosRewardsSupportResponse:
+    """POS 'Soporte' chat, Rewards topic: a CLIENT (not staff) asking about
+    their own loyalty points balance/history. Advisory only, and the agent
+    is instructed to never look up any clientId other than req.clientId."""
+    user_id = f"pos-rewards-support-{req.conversationId}"
+    session = await _get_or_create_pos_session(
+        app_name="loan_agents_pos_rewards_support",
+        user_id=user_id,
+        session_id=user_id,
+        initial_state={"pos_rewards_support_reply": ""},
+    )
+    context = {"conversationId": req.conversationId, "companyId": req.companyId, "clientId": req.clientId}
+    message = Content(role="user", parts=[Part(text=f"{req.message}\n\nContext: {json.dumps(context)}")])
+    async for event in _pos_rewards_support_runner.run_async(user_id=user_id, session_id=session.id, new_message=message):
+        if event.is_final_response() and event.content:
+            pass
+
+    updated = await _session_service.get_session(app_name="loan_agents_pos_rewards_support", user_id=user_id, session_id=session.id)
+    reply = updated.state.get("pos_rewards_support_reply", "").strip()
+    if not reply:
+        reply = "No pude generar una respuesta en este momento. Intenta de nuevo."
+    return PosRewardsSupportResponse(reply=reply)
 
 
 class OrderStaleEntry(BaseModel):

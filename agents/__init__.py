@@ -17,6 +17,7 @@ from agents.pos_clients_support import pos_clients_support_agent
 from agents.pos_income_support import pos_income_support_agent
 from agents.pos_expenses_support import pos_expenses_support_agent
 from agents.pos_accounting_support import pos_accounting_support_agent
+from agents.pos_rewards_support import pos_rewards_support_agent
 
 root_agent = orchestrator_agent
 
@@ -40,5 +41,6 @@ __all__ = [
     "pos_income_support_agent",
     "pos_expenses_support_agent",
     "pos_accounting_support_agent",
+    "pos_rewards_support_agent",
     "root_agent",
 ]
