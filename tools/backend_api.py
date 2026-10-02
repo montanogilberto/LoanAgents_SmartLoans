@@ -416,6 +416,48 @@ def get_recent_expenses(company_id: int, limit: int = 20) -> list[dict]:
     return mine[:limit]
 
 
+def _same_company(value, company_id: int) -> bool:
+    try:
+        return int(value) == int(company_id)
+    except (TypeError, ValueError):
+        return False
+
+
+def list_suppliers(company_id: int) -> list[dict]:
+    """Fetches this company's suppliers. The SP returns every company's rows
+    when it can't parse the companyId, so the companyId filter is re-applied
+    here — the unscoped list never leaves this function.
+
+    Args:
+        company_id: The company to filter to.
+
+    Returns:
+        List of supplier records (supplierId, supplierName, contactName,
+        phone, email, address, active '1'/'0', ...). No RFC column exists.
+    """
+    result = _post("/all_suppliers", {"suppliers": [{"companyId": company_id}]})
+    suppliers = result.get("suppliers", []) if isinstance(result, dict) else (result or [])
+    return [s for s in suppliers if _same_company(s.get("companyId"), company_id)]
+
+
+def list_products(company_id: int) -> list[dict]:
+    """Fetches this company's products via GET /all_products (sp_products_all),
+    which returns every company's products unscoped, so filtering by companyId
+    happens here. Unlike /by_company_products it is not limited to products
+    that have options.
+
+    Args:
+        company_id: The company to filter to.
+
+    Returns:
+        List of product records (productId, name, barCode, code, description,
+        companyId, ...).
+    """
+    result = _get("/all_products")
+    products = result.get("products", []) if isinstance(result, dict) else (result or [])
+    return [p for p in products if _same_company(p.get("companyId"), company_id)]
+
+
 def get_client_follow_ups(client_id: int, company_id: int) -> list[dict]:
     """Fetches this client's follow-up/collections history.
 
@@ -566,3 +608,61 @@ def list_open_orders() -> list[dict]:
     """
     result = _get("/list_orders")
     return result.get("orders", []) if isinstance(result, dict) else []
+
+
+def get_reservation_services(company_id: int) -> list[dict]:
+    """The company's catalog of bookable services, via sp_reservationServices
+    (smartloans_backend/modules/reservations.py). Only these can be booked.
+
+    Args:
+        company_id: The business's company id (from the turn's context).
+
+    Returns:
+        [{"reservationServiceId": int, "name": str, "description": str|None,
+        "durationMinutes": int|None, ...}] — active services only.
+    """
+    result = _post("/reservationServices", {"reservationServices": [{"companyId": company_id}]})
+    rows = result.get("result", []) if isinstance(result, dict) else []
+    return (rows[0].get("reservationServices") or []) if rows else []
+
+
+def get_reservation_hours(company_id: int) -> list[dict]:
+    """The company's weekly business hours, via sp_reservationHours.
+
+    Args:
+        company_id: The business's company id (from the turn's context).
+
+    Returns:
+        [{"dayOfWeek": 0-6 (0 = lunes), "openTime": "HH:MM", "closeTime": "HH:MM"}].
+        A weekday missing from the list is closed.
+    """
+    result = _post("/reservationHours", {"reservationHours": [{"companyId": company_id}]})
+    rows = result.get("result", []) if isinstance(result, dict) else []
+    return (rows[0].get("reservationHours") or []) if rows else []
+
+
+def get_available_slots(company_id: int, date: str, reservation_service_id: int) -> dict:
+    """Free reservation slots for one day and one service, via
+    sp_reservations action 6. Business hours, slot length and capacity are
+    all applied by the backend — only the slots returned here can actually
+    be booked.
+
+    Args:
+        company_id: The business's company id (from the turn's context).
+        date: The day to check, "YYYY-MM-DD".
+        reservation_service_id: reservationServiceId from get_reservation_services.
+
+    Returns:
+        {"date", "reservationServiceId", "serviceName", "durationMinutes",
+        "capacity", "open", "close", "slots": [{"timeSlot": "HH:MM",
+        "available": int}]}. open/close null = closed that day; empty "slots"
+        = full or already over. {"error": ...} for an invalid date or service.
+    """
+    result = _post("/reservations", {"reservations": [{
+        "action": 6, "companyId": company_id, "date": date,
+        "reservationServiceId": reservation_service_id,
+    }]})
+    if isinstance(result, dict) and result.get("error"):
+        return result
+    rows = result.get("result", []) if isinstance(result, dict) else []
+    return rows[0] if rows else {"error": "no availability returned"}

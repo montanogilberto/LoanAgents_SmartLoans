@@ -1,0 +1,12 @@
+{
+  "isPurchaseTicket": true,
+  "merchantName": "Sam's Club",
+  "ticketDate": "2026-10-01",
+  "total": 1701.93,
+  "paymentType": "TARJETA_CREDITO",
+  "lineItems": [
+    {"name": "Detergente Líquido Ariel RevitaColor 8.5 L", "quantity": 1, "lineTotal": 339.99},
+    {"name": "Jabón Líquido para Manos Member's Mark Antibacterial Aroma Mandarina 5 L", "quantity": 1, "lineTotal": 166.00},
+    {"name": "Suavizante de Telas Suavitel Cuidado Diario Fresca Primavera 8.5 L", "quantity": 2, "lineTotal": 429.96}
+  ]
+}

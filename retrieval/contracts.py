@@ -20,6 +20,7 @@ word once a cashier confirms.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Callable, Union
 
@@ -50,6 +51,7 @@ class FieldSpec:
     min_digits: int | None = None   # count of digits in the value, e.g. a phone number
     min_value: float | None = None  # inclusive lower bound for int/float
     min_items: int | None = None    # inclusive lower bound for list length
+    pattern: str | None = None      # full-match regex for str values, e.g. a date
 
     def is_required(self, fields: dict) -> bool:
         return self.required(fields) if callable(self.required) else self.required
@@ -81,6 +83,8 @@ class FieldSpec:
             return f"{self.name} must be >= {self.min_value}, got {value!r}"
         if self.min_items is not None and isinstance(value, list) and len(value) < self.min_items:
             return f"{self.name} must have at least {self.min_items} item(s), got {value!r}"
+        if self.pattern is not None and not re.fullmatch(self.pattern, str(value)):
+            return f"{self.name} has the wrong format, got {value!r}"
         return None
 
 
@@ -143,6 +147,18 @@ CONTRACTS: dict[str, Contract] = {
             FieldSpec("paymentMethod", str, required=True),
             FieldSpec("notes", str, required=False),
             FieldSpec("paymentDate", str, required=False),
+        ),
+    ),
+    "CREATE_RESERVATION": Contract(
+        capability="CREATE_RESERVATION",
+        description="agents/whatsapp_reservations — slot for a catalog service booked by a customer over WhatsApp",
+        fields=(
+            FieldSpec("reservationServiceId", int, required=True, min_value=1),
+            FieldSpec("reservationDate", str, required=True, pattern=r"\d{4}-\d{2}-\d{2}"),
+            FieldSpec("timeSlot", str, required=True, pattern=r"\d{2}:\d{2}"),
+            FieldSpec("clientName", str, required=True),
+            FieldSpec("serviceDetail", str, required=False),
+            FieldSpec("notes", str, required=False),
         ),
     ),
 }
