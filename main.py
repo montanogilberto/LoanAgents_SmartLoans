@@ -10,11 +10,13 @@ only talks to it over HTTP (see tools/backend_api.py).
 Run:
     uvicorn main:app --host 0.0.0.0 --port 8080
 """
+import asyncio
 import base64
 import json
+import logging
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -28,13 +30,17 @@ from google.genai.types import Content, Part
 from agents import (
     orchestrator_agent, contract_agent, id_document_agent, face_validation_agent,
     analysis_agent, evidence_validation_agent, cash_register_agent, expense_agent,
-    client_followup_agent, order_triage_agent, pos_clients_support_agent,
+    ticket_extraction_agent, client_followup_agent, order_triage_agent, pos_clients_support_agent,
     pos_income_support_agent, pos_expenses_support_agent, pos_accounting_support_agent,
-    pos_rewards_support_agent,
+    pos_rewards_support_agent, whatsapp_reservations_agent,
 )
 from agents.support import support_agent
+from agents.ticket_extraction.matching import UNAVAILABLE, match_product, match_supplier
+from agents.ticket_extraction.reconcile import payment_label, reconcile
 from config.settings import PORT
-from tools.backend_api import get_credit_score, get_client_loans
+from tools.backend_api import get_credit_score, get_client_loans, list_products, list_suppliers
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="LoanAgents SmartLoans")
 
@@ -121,6 +127,7 @@ _analysis_runner = Runner(agent=analysis_agent, app_name="loan_agents_analysis",
 _evidence_runner = Runner(agent=evidence_validation_agent, app_name="loan_agents_evidence", session_service=_session_service)
 _cash_register_runner = Runner(agent=cash_register_agent, app_name="loan_agents_cash_register", session_service=_session_service)
 _expense_runner = Runner(agent=expense_agent, app_name="loan_agents_expense", session_service=_session_service)
+_ticket_extraction_runner = Runner(agent=ticket_extraction_agent, app_name="loan_agents_ticket", session_service=_session_service)
 _client_followup_runner = Runner(agent=client_followup_agent, app_name="loan_agents_client_followup", session_service=_session_service)
 _order_triage_runner = Runner(agent=order_triage_agent, app_name="loan_agents_order_triage", session_service=_session_service)
 _pos_clients_support_runner = Runner(agent=pos_clients_support_agent, app_name="loan_agents_pos_clients_support", session_service=_session_service)
@@ -128,6 +135,7 @@ _pos_income_support_runner = Runner(agent=pos_income_support_agent, app_name="lo
 _pos_expenses_support_runner = Runner(agent=pos_expenses_support_agent, app_name="loan_agents_pos_expenses_support", session_service=_session_service)
 _pos_accounting_support_runner = Runner(agent=pos_accounting_support_agent, app_name="loan_agents_pos_accounting_support", session_service=_session_service)
 _pos_rewards_support_runner = Runner(agent=pos_rewards_support_agent, app_name="loan_agents_pos_rewards_support", session_service=_session_service)
+_whatsapp_reservations_runner = Runner(agent=whatsapp_reservations_agent, app_name="loan_agents_whatsapp_reservations", session_service=_session_service)
 
 
 class NegotiateRequest(BaseModel):
@@ -859,6 +867,204 @@ async def categorize_expense(req: ExpenseCategorizeRequest) -> ExpenseCategorize
     )
 
 
+class ExtractTicketRequest(BaseModel):
+    ticketUrl: str | None = None
+    ticketBase64: str | None = None
+    # When given, the merchant and each line are matched against this
+    # company's existing suppliers/products (suggestions only).
+    companyId: int | None = None
+
+
+class MatchCandidate(BaseModel):
+    id: int | None = None
+    name: str = ""
+    score: float = 0.0
+
+
+class RecordMatch(BaseModel):
+    # MATCHED: one clear existing record, id/name set.
+    # AMBIGUOUS: plausible candidates, user must pick one.
+    # NEW: nothing plausible — offer "Nuevo proveedor" / "Agregar producto".
+    # UNAVAILABLE: no companyId, nothing to match, or the backend lookup failed.
+    status: str = UNAVAILABLE
+    id: int | None = None
+    name: str = ""
+    score: float = 0.0
+    candidates: list[MatchCandidate] = []
+
+
+class TicketLineItemOut(BaseModel):
+    name: str = ""
+    quantity: float = 1.0
+    unitPrice: float = 0.0
+    lineTotal: float = 0.0
+    needsReview: bool = False
+    productMatch: RecordMatch = RecordMatch()
+
+
+class ExtractTicketResponse(BaseModel):
+    isPurchaseTicket: bool = False
+    confidence: float = 0.0
+    merchantName: str = ""
+    merchantRfc: str = ""
+    ticketNumber: str = ""
+    ticketDate: str = ""              # ISO YYYY-MM-DD, "" when unreadable/invalid
+    currency: str = "MXN"
+    subtotal: float = 0.0
+    tax: float = 0.0
+    total: float = 0.0
+    # Pre-selects the form's "Método de Pago": exactly "Efectivo", "Tarjeta" or
+    # "Transferencia" (the dropdown/ledger values), or "" when the ticket shows
+    # none or a type the form lacks (cheque). paymentType keeps credit vs. debit.
+    paymentMethod: str = ""
+    paymentType: str = "NO_VISIBLE"   # raw enum from the agent
+    paymentTypeRaw: str = ""          # payment wording exactly as printed
+    cardLast4: str = ""
+    supplierMatch: RecordMatch = RecordMatch()
+    lineItems: list[TicketLineItemOut] = []
+    unreadableFields: list[str] = []
+    notes: list[str] = []
+    # Server-side checks (agents/ticket_extraction/reconcile.py).
+    itemsTotal: float = 0.0
+    totalMatchesItems: bool | None = None
+    issues: list[str] = []
+    needsReview: bool = True
+
+
+def _sniff_image_mime(data: bytes) -> str:
+    if data.startswith(b"\x89PNG"):
+        return "image/png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
+
+
+def _build_ticket_response(
+    result: dict,
+    supplier_match: RecordMatch | None = None,
+    product_matches: list[RecordMatch] | None = None,
+) -> ExtractTicketResponse:
+    """Post-processing between the model's JSON and the API response: code-side
+    checks (reconcile), payment label, date blanking. Pure — no I/O."""
+    checks = reconcile(result)
+    payment_type = str(result.get("paymentType", "NO_VISIBLE") or "NO_VISIBLE")
+    merchant_name = str(result.get("merchantName", "") or "")
+    raw_items = [i for i in result.get("lineItems", []) if isinstance(i, dict)]
+    supplier_match = supplier_match or RecordMatch()
+    if product_matches is None:
+        product_matches = [RecordMatch() for _ in raw_items]
+
+    return ExtractTicketResponse(
+        isPurchaseTicket=bool(result.get("isPurchaseTicket", False)),
+        confidence=float(result.get("confidence", 0.0) or 0.0),
+        merchantName=merchant_name,
+        merchantRfc=str(result.get("merchantRfc", "") or ""),
+        ticketNumber=str(result.get("ticketNumber", "") or ""),
+        ticketDate=checks["ticketDate"],
+        currency=str(result.get("currency", "MXN") or "MXN"),
+        subtotal=float(result.get("subtotal", 0.0) or 0.0),
+        tax=float(result.get("tax", 0.0) or 0.0),
+        total=float(result.get("total", 0.0) or 0.0),
+        paymentMethod=payment_label(payment_type),
+        paymentType=payment_type,
+        paymentTypeRaw=str(result.get("paymentTypeRaw", "") or ""),
+        cardLast4=str(result.get("cardLast4", "") or "")[-4:],
+        supplierMatch=supplier_match,
+        lineItems=[
+            TicketLineItemOut(
+                name=str(i.get("name", "") or ""),
+                quantity=float(i.get("quantity", 1.0) or 0.0),
+                unitPrice=float(i.get("unitPrice", 0.0) or 0.0),
+                lineTotal=float(i.get("lineTotal", 0.0) or 0.0),
+                needsReview=bool(i.get("needsReview", False)),
+                productMatch=match,
+            )
+            for i, match in zip(raw_items, product_matches)
+        ],
+        unreadableFields=[str(f) for f in result.get("unreadableFields", [])],
+        notes=[str(n) for n in result.get("notes", [])],
+        itemsTotal=checks["itemsTotal"],
+        totalMatchesItems=checks["totalMatchesItems"],
+        issues=checks["issues"],
+        needsReview=checks["needsReview"],
+    )
+
+
+async def _extract_ticket_raw(ticket_bytes: bytes) -> tuple[object, dict]:
+    """Runs the ticket agent on an image. Returns (raw, parsed): raw is exactly
+    what the model left in session state (str or dict), parsed is that as a dict
+    ({} when unusable). Split out so ticket_eval/ can record the model's own
+    output before any of our post-processing touches it."""
+    user_id = f"ticket-{uuid.uuid4()}"
+    session = await _session_service.create_session(
+        app_name="loan_agents_ticket",
+        user_id=user_id,
+        session_id=str(uuid.uuid4()),
+        state={"ticket_extraction_result": "{}"},
+    )
+    message = Content(role="user", parts=[
+        Part(text="Expense ticket photo is attached below."),
+        Part.from_bytes(data=ticket_bytes, mime_type=_sniff_image_mime(ticket_bytes)),
+    ])
+    async for event in _ticket_extraction_runner.run_async(user_id=user_id, session_id=session.id, new_message=message):
+        if event.is_final_response() and event.content:
+            pass  # final text is read from session state via output_key below
+
+    updated = await _session_service.get_session(app_name="loan_agents_ticket", user_id=user_id, session_id=session.id)
+    raw = updated.state.get("ticket_extraction_result", "{}")
+    try:
+        result = json.loads(_strip_json_fences(raw)) if isinstance(raw, str) else raw
+    except json.JSONDecodeError:
+        result = {}
+    if not isinstance(result, dict):
+        return raw, {}
+    # With output_schema, ADK leaves enum members (str subclasses) in state;
+    # str() on one gives "PaymentType.EFECTIVO". A JSON round-trip reduces
+    # them to plain strings so everything downstream sees the schema's values.
+    return raw, json.loads(json.dumps(result, default=str))
+
+
+@app.post("/expenses/extract-ticket", response_model=ExtractTicketResponse)
+async def extract_expense_ticket(req: ExtractTicketRequest) -> ExtractTicketResponse:
+    """Reads an expense ticket photo and returns merchant, date, total, type of
+    payment and per-product lines to pre-fill Nuevo Egreso. Advisory only —
+    never creates the expense. Totals/dates are re-checked in code, and
+    anything unreadable or inconsistent comes back in `issues` with
+    needsReview=true rather than as a silently wrong value."""
+    ticket_bytes = await _resolve_image(req.ticketUrl, req.ticketBase64)
+    if not ticket_bytes:
+        raise HTTPException(status_code=400, detail="ticketUrl or ticketBase64 is required")
+
+    raw, result = await _extract_ticket_raw(ticket_bytes)
+
+    if not result:
+        return _build_ticket_response(result)
+
+    merchant_name = str(result.get("merchantName", "") or "")
+    raw_items = [i for i in result.get("lineItems", []) if isinstance(i, dict)]
+
+    supplier_match = RecordMatch()
+    product_matches = [RecordMatch() for _ in raw_items]
+    if req.companyId is not None:
+        # Lookups are blocking HTTP calls; run them off the event loop, and
+        # never let a backend hiccup fail an otherwise good extraction.
+        suppliers, products = await asyncio.gather(
+            asyncio.to_thread(list_suppliers, req.companyId),
+            asyncio.to_thread(list_products, req.companyId),
+            return_exceptions=True,
+        )
+        if isinstance(suppliers, Exception):
+            logger.warning("extract-ticket: supplier lookup failed: %s", suppliers)
+        else:
+            supplier_match = RecordMatch(**match_supplier(merchant_name, suppliers))
+        if isinstance(products, Exception):
+            logger.warning("extract-ticket: product lookup failed: %s", products)
+        else:
+            product_matches = [RecordMatch(**match_product(str(i.get("name", "") or ""), products)) for i in raw_items]
+
+    return _build_ticket_response(result, supplier_match, product_matches)
+
+
 class ClientFollowUpSuggestionRequest(BaseModel):
     clientId: int
     companyId: int
@@ -1109,6 +1315,88 @@ async def support_pos_rewards(req: PosRewardsSupportRequest) -> PosRewardsSuppor
     if not reply:
         reply = "No pude generar una respuesta en este momento. Intenta de nuevo."
     return PosRewardsSupportResponse(reply=reply)
+
+
+class WhatsAppReservationsRequest(BaseModel):
+    companyId: int
+    companyName: str | None = None
+    # The WhatsApp number the customer wrote to belongs to one branch
+    # (smartloans_backend dbo.whatsappChannels).
+    branchId: int | None = None
+    branchName: str | None = None
+    phone: str
+    message: str
+    customerName: str | None = None
+    recentReservation: dict | None = None
+
+
+class WhatsAppReservationsResponse(BaseModel):
+    reply: str
+    pendingAction: PendingAction | None = None
+
+
+_WEEKDAYS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+
+# A WhatsApp chat lives for months. After this long without messages the
+# customer starts a new conversation: fresh history (bounded tokens/memory,
+# no stale "mañana" from last week) — a booking already made still reaches
+# the agent through recentReservation.
+_WHATSAPP_SESSION_IDLE_SECONDS = 6 * 60 * 60
+
+
+@app.post("/support/whatsapp-reservations", response_model=WhatsAppReservationsResponse)
+async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> WhatsAppReservationsResponse:
+    """A business's customers chatting on WhatsApp: shows its service catalog
+    and free slots, and proposes a CREATE_RESERVATION. smartloans_backend/modules/
+    whatsappReservations.py books it only after the customer's "sí".
+
+    The session is keyed by phone so the chat keeps its history. Because it
+    persists, a proposal from an earlier turn stays in session.state — so
+    pendingAction is read from THIS turn's events only, never from state.
+
+    Keyed by company + branch + phone: the same customer chatting with two
+    branches (two WhatsApp numbers) gets two separate conversations."""
+    user_id = f"wa-reservations-{req.companyId}-{req.branchId or 0}-{req.phone}"
+    existing = await _session_service.get_session(
+        app_name="loan_agents_whatsapp_reservations", user_id=user_id, session_id=user_id)
+    if existing is not None and time.time() - existing.last_update_time > _WHATSAPP_SESSION_IDLE_SECONDS:
+        await _session_service.delete_session(
+            app_name="loan_agents_whatsapp_reservations", user_id=user_id, session_id=user_id)
+    session = await _get_or_create_pos_session(
+        app_name="loan_agents_whatsapp_reservations",
+        user_id=user_id,
+        session_id=user_id,
+        initial_state={"whatsapp_reservations_reply": ""},
+    )
+    # Hermosillo is UTC-7 all year — same convention as tools/backend_api.py.
+    now_local = datetime.now(timezone.utc) - timedelta(hours=7)
+    context = {
+        "companyId": req.companyId,
+        "companyName": req.companyName,
+        "branchName": req.branchName,
+        "customerName": req.customerName,
+        "today": now_local.date().isoformat(),
+        "nowTime": now_local.strftime("%H:%M"),
+        "nextDays": [
+            {"date": d.isoformat(), "weekday": _WEEKDAYS_ES[d.weekday()]}
+            for d in (now_local.date() + timedelta(days=i) for i in range(8))
+        ],
+        "recentReservation": req.recentReservation,
+    }
+    message = Content(role="user", parts=[Part(text=f"{req.message}\n\nContext: {json.dumps(context, ensure_ascii=False)}")])
+
+    pending_raw = None
+    async for event in _whatsapp_reservations_runner.run_async(user_id=user_id, session_id=session.id, new_message=message):
+        delta = event.actions.state_delta if event.actions else {}
+        if "pending_action" in delta:
+            pending_raw = delta["pending_action"]
+
+    updated = await _session_service.get_session(app_name="loan_agents_whatsapp_reservations", user_id=user_id, session_id=session.id)
+    reply = updated.state.get("whatsapp_reservations_reply", "").strip()
+    if not reply:
+        reply = "No pude generar una respuesta en este momento. Intenta de nuevo."
+    pending_action = PendingAction(**pending_raw) if isinstance(pending_raw, dict) else None
+    return WhatsAppReservationsResponse(reply=reply, pendingAction=pending_action)
 
 
 class OrderStaleEntry(BaseModel):
