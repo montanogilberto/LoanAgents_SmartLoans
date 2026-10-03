@@ -14,3 +14,8 @@ GCP_LOCATION = os.environ.get("GCP_LOCATION", "")
 
 SMARTLOANS_BACKEND_URL = os.environ.get("SMARTLOANS_BACKEND_URL", "https://smartloansbackend.azurewebsites.net").rstrip("/")
 PORT = int(os.environ.get("PORT", "8080"))
+
+# Shared secret for server-to-server calls into smartloans_backend (same value as
+# the backend's WORKER_KEY app setting). Without it, token usage can't be recorded
+# (the backend rejects it) and metering quietly turns itself off.
+WORKER_KEY = os.environ.get("WORKER_KEY", "")

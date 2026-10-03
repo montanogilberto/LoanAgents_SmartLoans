@@ -23,7 +23,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from google.adk.runners import Runner
+from google.adk.runners import Runner  # noqa: F401 — kept for type references
 from google.adk.sessions import InMemorySessionService
 from google.genai.types import Content, Part
 
@@ -36,13 +36,18 @@ from agents import (
 )
 from agents.support import support_agent
 from agents.ticket_extraction.matching import UNAVAILABLE, match_product, match_supplier
+from agents.ticket_extraction.proposal import build_proposal, evaluate
 from agents.ticket_extraction.reconcile import payment_label, reconcile
 from config.settings import PORT
+from metering import MeteredRunner, metering_middleware
 from tools.backend_api import get_credit_score, get_client_loans, list_products, list_suppliers
 
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="LoanAgents SmartLoans")
+
+# Bills each agent run's real token usage to the request's company (see metering.py).
+app.middleware("http")(metering_middleware)
 
 # --------------------------------------------------
 # CORS configuration
@@ -118,24 +123,24 @@ async def _get_or_create_pos_session(app_name: str, user_id: str, session_id: st
     return await _session_service.create_session(
         app_name=app_name, user_id=user_id, session_id=session_id, state=initial_state,
     )
-_negotiate_runner = Runner(agent=orchestrator_agent, app_name="loan_agents", session_service=_session_service)
-_support_runner = Runner(agent=support_agent, app_name="loan_agents_support", session_service=_session_service)
-_contract_runner = Runner(agent=contract_agent, app_name="loan_agents_contract", session_service=_session_service)
-_id_extraction_runner = Runner(agent=id_document_agent, app_name="loan_agents_id", session_service=_session_service)
-_face_validation_runner = Runner(agent=face_validation_agent, app_name="loan_agents_face", session_service=_session_service)
-_analysis_runner = Runner(agent=analysis_agent, app_name="loan_agents_analysis", session_service=_session_service)
-_evidence_runner = Runner(agent=evidence_validation_agent, app_name="loan_agents_evidence", session_service=_session_service)
-_cash_register_runner = Runner(agent=cash_register_agent, app_name="loan_agents_cash_register", session_service=_session_service)
-_expense_runner = Runner(agent=expense_agent, app_name="loan_agents_expense", session_service=_session_service)
-_ticket_extraction_runner = Runner(agent=ticket_extraction_agent, app_name="loan_agents_ticket", session_service=_session_service)
-_client_followup_runner = Runner(agent=client_followup_agent, app_name="loan_agents_client_followup", session_service=_session_service)
-_order_triage_runner = Runner(agent=order_triage_agent, app_name="loan_agents_order_triage", session_service=_session_service)
-_pos_clients_support_runner = Runner(agent=pos_clients_support_agent, app_name="loan_agents_pos_clients_support", session_service=_session_service)
-_pos_income_support_runner = Runner(agent=pos_income_support_agent, app_name="loan_agents_pos_income_support", session_service=_session_service)
-_pos_expenses_support_runner = Runner(agent=pos_expenses_support_agent, app_name="loan_agents_pos_expenses_support", session_service=_session_service)
-_pos_accounting_support_runner = Runner(agent=pos_accounting_support_agent, app_name="loan_agents_pos_accounting_support", session_service=_session_service)
-_pos_rewards_support_runner = Runner(agent=pos_rewards_support_agent, app_name="loan_agents_pos_rewards_support", session_service=_session_service)
-_whatsapp_reservations_runner = Runner(agent=whatsapp_reservations_agent, app_name="loan_agents_whatsapp_reservations", session_service=_session_service)
+_negotiate_runner = MeteredRunner(agent=orchestrator_agent, app_name="loan_agents", session_service=_session_service)
+_support_runner = MeteredRunner(agent=support_agent, app_name="loan_agents_support", session_service=_session_service)
+_contract_runner = MeteredRunner(agent=contract_agent, app_name="loan_agents_contract", session_service=_session_service)
+_id_extraction_runner = MeteredRunner(agent=id_document_agent, app_name="loan_agents_id", session_service=_session_service)
+_face_validation_runner = MeteredRunner(agent=face_validation_agent, app_name="loan_agents_face", session_service=_session_service)
+_analysis_runner = MeteredRunner(agent=analysis_agent, app_name="loan_agents_analysis", session_service=_session_service)
+_evidence_runner = MeteredRunner(agent=evidence_validation_agent, app_name="loan_agents_evidence", session_service=_session_service)
+_cash_register_runner = MeteredRunner(agent=cash_register_agent, app_name="loan_agents_cash_register", session_service=_session_service)
+_expense_runner = MeteredRunner(agent=expense_agent, app_name="loan_agents_expense", session_service=_session_service)
+_ticket_extraction_runner = MeteredRunner(agent=ticket_extraction_agent, app_name="loan_agents_ticket", session_service=_session_service)
+_client_followup_runner = MeteredRunner(agent=client_followup_agent, app_name="loan_agents_client_followup", session_service=_session_service)
+_order_triage_runner = MeteredRunner(agent=order_triage_agent, app_name="loan_agents_order_triage", session_service=_session_service)
+_pos_clients_support_runner = MeteredRunner(agent=pos_clients_support_agent, app_name="loan_agents_pos_clients_support", session_service=_session_service)
+_pos_income_support_runner = MeteredRunner(agent=pos_income_support_agent, app_name="loan_agents_pos_income_support", session_service=_session_service)
+_pos_expenses_support_runner = MeteredRunner(agent=pos_expenses_support_agent, app_name="loan_agents_pos_expenses_support", session_service=_session_service)
+_pos_accounting_support_runner = MeteredRunner(agent=pos_accounting_support_agent, app_name="loan_agents_pos_accounting_support", session_service=_session_service)
+_pos_rewards_support_runner = MeteredRunner(agent=pos_rewards_support_agent, app_name="loan_agents_pos_rewards_support", session_service=_session_service)
+_whatsapp_reservations_runner = MeteredRunner(agent=whatsapp_reservations_agent, app_name="loan_agents_whatsapp_reservations", session_service=_session_service)
 
 
 class NegotiateRequest(BaseModel):
@@ -902,6 +907,47 @@ class TicketLineItemOut(BaseModel):
     productMatch: RecordMatch = RecordMatch()
 
 
+class ProposalCandidate(BaseModel):
+    id: int | None = None
+    name: str = ""
+    score: float = 0.0
+
+
+class ProposalSupplier(BaseModel):
+    # use: register against the matched supplier. create: register a new one named `name`.
+    # choose: the person must pick (ambiguous / unavailable) — never auto-selected.
+    action: str = "choose"
+    supplierId: int | None = None
+    name: str = ""
+    candidates: list[ProposalCandidate] = []
+
+
+class ProposalLine(BaseModel):
+    index: int = 0
+    ticketName: str = ""
+    quantity: float = 1.0
+    unitCost: float = 0.0      # purchase cost PER UNIT
+    lineTotal: float = 0.0
+    action: str = "choose"     # use | create | choose
+    productId: int | None = None
+    name: str = ""
+    candidates: list[ProposalCandidate] = []
+    needsReview: bool = False
+
+
+class TicketProposal(BaseModel):
+    supplier: ProposalSupplier = ProposalSupplier()
+    lines: list[ProposalLine] = []
+    paymentMethod: str = ""
+    paymentDate: str = ""
+    ticketTotal: float = 0.0
+
+
+class TicketVerdict(BaseModel):
+    ready: bool = False
+    reasons: list[str] = []
+
+
 class ExtractTicketResponse(BaseModel):
     isPurchaseTicket: bool = False
     confidence: float = 0.0
@@ -929,6 +975,10 @@ class ExtractTicketResponse(BaseModel):
     totalMatchesItems: bool | None = None
     issues: list[str] = []
     needsReview: bool = True
+    # The operation to register, decided here (agents/ticket_extraction/proposal.py):
+    # the POS only displays it and applies the person's edits.
+    proposal: TicketProposal | None = None
+    verdict: TicketVerdict | None = None
 
 
 def _sniff_image_mime(data: bytes) -> str:
@@ -954,7 +1004,7 @@ def _build_ticket_response(
     if product_matches is None:
         product_matches = [RecordMatch() for _ in raw_items]
 
-    return ExtractTicketResponse(
+    response = ExtractTicketResponse(
         isPurchaseTicket=bool(result.get("isPurchaseTicket", False)),
         confidence=float(result.get("confidence", 0.0) or 0.0),
         merchantName=merchant_name,
@@ -988,6 +1038,11 @@ def _build_ticket_response(
         issues=checks["issues"],
         needsReview=checks["needsReview"],
     )
+    data = response.model_dump()
+    proposal = build_proposal(data)
+    response.proposal = TicketProposal(**proposal)
+    response.verdict = TicketVerdict(**evaluate(data, proposal))
+    return response
 
 
 async def _extract_ticket_raw(ticket_bytes: bytes) -> tuple[object, dict]:
