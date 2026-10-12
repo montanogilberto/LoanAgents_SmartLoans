@@ -32,12 +32,13 @@ from agents import (
     analysis_agent, evidence_validation_agent, cash_register_agent, expense_agent,
     ticket_extraction_agent, client_followup_agent, order_triage_agent, pos_clients_support_agent,
     pos_income_support_agent, pos_expenses_support_agent, pos_accounting_support_agent,
-    pos_rewards_support_agent, whatsapp_reservations_agent,
+    pos_rewards_support_agent, whatsapp_reservations_agent, product_extraction_agent,
 )
 from agents.support import support_agent
 from agents.ticket_extraction.matching import UNAVAILABLE, match_product, match_supplier
 from agents.ticket_extraction.proposal import build_proposal, evaluate
 from agents.ticket_extraction.reconcile import payment_label, reconcile
+from agents.product_extraction.reconcile import reconcile as reconcile_product_label
 from config.settings import PORT
 from metering import MeteredRunner, metering_middleware
 from tools.backend_api import get_credit_score, get_client_loans, list_products, list_suppliers
@@ -133,6 +134,7 @@ _evidence_runner = MeteredRunner(agent=evidence_validation_agent, app_name="loan
 _cash_register_runner = MeteredRunner(agent=cash_register_agent, app_name="loan_agents_cash_register", session_service=_session_service)
 _expense_runner = MeteredRunner(agent=expense_agent, app_name="loan_agents_expense", session_service=_session_service)
 _ticket_extraction_runner = MeteredRunner(agent=ticket_extraction_agent, app_name="loan_agents_ticket", session_service=_session_service)
+_product_extraction_runner = MeteredRunner(agent=product_extraction_agent, app_name="loan_agents_product", session_service=_session_service)
 _client_followup_runner = MeteredRunner(agent=client_followup_agent, app_name="loan_agents_client_followup", session_service=_session_service)
 _order_triage_runner = MeteredRunner(agent=order_triage_agent, app_name="loan_agents_order_triage", session_service=_session_service)
 _pos_clients_support_runner = MeteredRunner(agent=pos_clients_support_agent, app_name="loan_agents_pos_clients_support", session_service=_session_service)
@@ -1118,6 +1120,128 @@ async def extract_expense_ticket(req: ExtractTicketRequest) -> ExtractTicketResp
             product_matches = [RecordMatch(**match_product(str(i.get("name", "") or ""), products)) for i in raw_items]
 
     return _build_ticket_response(result, supplier_match, product_matches)
+
+
+# ── Product label reading — POST /products/extract-label ─────────────────────
+MAX_PRODUCT_PHOTOS = 3
+
+
+class ProductPhoto(BaseModel):
+    url: str | None = None
+    base64: str | None = None
+
+
+class ExtractProductLabelRequest(BaseModel):
+    # 1-3 photos of the same product (front label, back label with barcode...).
+    photos: list[ProductPhoto]
+    # When given, the result is checked against this company's products so the
+    # form can warn "ya existe" instead of creating a duplicate.
+    companyId: int | None = None
+
+
+class ExtractProductLabelResponse(BaseModel):
+    isProduct: bool = False
+    confidence: float = 0.0
+    brand: str = ""
+    productName: str = ""
+    variant: str = ""
+    # brand + product + variant + net content, ready for the form's "Nombre".
+    suggestedName: str = ""
+    description: str = ""
+    barCode: str = ""              # only when it passed the GTIN check digit
+    netContent: float = 0.0
+    unitOfMeasure: str = ""        # g | kg | ml | L | pz, "" when not read
+    netContentRaw: str = ""
+    expirationDate: str = ""       # ISO YYYY-MM-DD, "" when not legible
+    expirationRaw: str = ""
+    lotNumber: str = ""
+    manufacturer: str = ""
+    unreadableFields: list[str] = []
+    notes: list[str] = []
+    issues: list[str] = []         # Spanish, for the person reviewing
+    needsReview: bool = True
+    # Same barcode already registered (status MATCHED, matchedBy "barCode"),
+    # or a likely same product by name (MATCHED/AMBIGUOUS, matchedBy "name").
+    existingProduct: RecordMatch = RecordMatch()
+    matchedBy: str = ""            # "barCode" | "name" | ""
+
+
+async def _extract_product_label_raw(images: list[bytes]) -> dict:
+    """Runs the product label agent on 1-3 photos; {} when unusable."""
+    user_id = f"product-{uuid.uuid4()}"
+    session = await _session_service.create_session(
+        app_name="loan_agents_product",
+        user_id=user_id,
+        session_id=str(uuid.uuid4()),
+        state={"product_extraction_result": "{}"},
+    )
+    parts = [Part(text=f"{len(images)} photo(s) of the SAME product are attached below.")]
+    for n, img in enumerate(images, start=1):
+        parts.append(Part(text=f"Photo {n}:"))
+        parts.append(Part.from_bytes(data=img, mime_type=_sniff_image_mime(img)))
+    message = Content(role="user", parts=parts)
+    async for event in _product_extraction_runner.run_async(user_id=user_id, session_id=session.id, new_message=message):
+        if event.is_final_response() and event.content:
+            pass  # final text is read from session state via output_key below
+
+    updated = await _session_service.get_session(app_name="loan_agents_product", user_id=user_id, session_id=session.id)
+    raw = updated.state.get("product_extraction_result", "{}")
+    try:
+        result = json.loads(_strip_json_fences(raw)) if isinstance(raw, str) else raw
+    except json.JSONDecodeError:
+        result = {}
+    if not isinstance(result, dict):
+        return {}
+    # Enum members -> plain strings (same reason as _extract_ticket_raw).
+    return json.loads(json.dumps(result, default=str))
+
+
+def _find_existing_product(checked: dict, products: list[dict]) -> tuple[RecordMatch, str]:
+    """Exact barcode first (a GTIN identifies the product); otherwise the
+    ticket agent's name matcher on the suggested name."""
+    code = checked.get("barCode") or ""
+    if code:
+        for p in products:
+            if str(p.get("barCode") or "").strip() == code:
+                return RecordMatch(status="MATCHED", id=p.get("productId"), name=str(p.get("name") or ""), score=1.0), "barCode"
+    name = checked.get("suggestedName") or ""
+    if not name:
+        return RecordMatch(), ""
+    match = RecordMatch(**match_product(name, products))
+    return match, ("name" if match.status in ("MATCHED", "AMBIGUOUS") else "")
+
+
+@app.post("/products/extract-label", response_model=ExtractProductLabelResponse)
+async def extract_product_label(req: ExtractProductLabelRequest) -> ExtractProductLabelResponse:
+    """Reads photos of a physical product (front/back label) and returns brand,
+    name, description, barcode, net content and expiration to pre-fill the POS
+    "Nuevo Producto" form. Advisory only — never creates the product. The
+    barcode check digit, unit and dates are verified in code; anything
+    unreadable or inconsistent comes back in `issues` with needsReview=true."""
+    photos = req.photos[:MAX_PRODUCT_PHOTOS]
+    images = [b for b in await asyncio.gather(*(_resolve_image(p.url, p.base64) for p in photos)) if b]
+    if not images:
+        raise HTTPException(status_code=400, detail="at least one photo (url or base64) is required")
+
+    result = await _extract_product_label_raw(images)
+    if not result:
+        return ExtractProductLabelResponse(issues=["No se pudo leer la etiqueta; intenta con otra foto."])
+
+    checked = reconcile_product_label(result)
+    existing, matched_by = RecordMatch(), ""
+    if req.companyId is not None and checked["isProduct"]:
+        try:
+            products = await asyncio.to_thread(list_products, req.companyId)
+        except Exception as exc:  # a lookup hiccup never fails a good reading
+            logger.warning("extract-label: product lookup failed: %s", exc)
+        else:
+            existing, matched_by = _find_existing_product(checked, products)
+            if matched_by == "barCode":
+                checked["issues"].append(
+                    f"Este código de barras ya está registrado como «{existing.name}» (#{existing.id}).")
+                checked["needsReview"] = True
+
+    return ExtractProductLabelResponse(**checked, existingProduct=existing, matchedBy=matched_by)
 
 
 class ClientFollowUpSuggestionRequest(BaseModel):
