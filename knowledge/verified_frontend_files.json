@@ -1,0 +1,6 @@
+[
+  "clientsApi.ts",
+  "expensesApi.ts",
+  "incomeApi.ts",
+  "rewardsApi.ts"
+]

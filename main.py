@@ -40,6 +40,8 @@ from agents.ticket_extraction.proposal import build_proposal, evaluate
 from agents.ticket_extraction.reconcile import payment_label, reconcile
 from agents.product_extraction.reconcile import reconcile as reconcile_product_label
 from config.settings import PORT
+from intake_api import router as intake_router
+from site_commercial.routes import router as site_router
 from metering import MeteredRunner, metering_middleware
 from tools.backend_api import get_credit_score, get_client_loans, list_products, list_suppliers
 
@@ -80,6 +82,13 @@ origins = [
     # Custom domain
     "https://www.rpmtoolsmx.com",
 
+    # GMO Ecosystem website ("Ask the Factory", visits, leads — intake_api.py,
+    # site_commercial/) and its local dev server
+    "https://www.gmoecosystem.com",
+    "https://gmoecosystem.com",
+    "https://kind-coast-035f5401e.5.azurestaticapps.net",
+    "http://localhost:8080",
+
     # Backend API (server-to-server)
     "https://smartloansbackend.azurewebsites.net",
 ]
@@ -91,6 +100,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# GMO Ecosystem website: Business Intake chat + visit counter, AI token allowance,
+# leads and lead follow-up (see intake_api.py and site_commercial/).
+app.include_router(intake_router)
+app.include_router(site_router)
 
 
 def _strip_json_fences(text: str) -> str:

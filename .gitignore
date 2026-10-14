@@ -10,3 +10,6 @@ ticket_eval/tickets/*
 !ticket_eval/tickets/.gitkeep
 ticket_eval/results/*
 !ticket_eval/results/.gitkeep
+
+# Website visits / leads database (site_commercial/) — local only
+data/
