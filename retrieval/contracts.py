@@ -149,6 +149,13 @@ CONTRACTS: dict[str, Contract] = {
             FieldSpec("paymentDate", str, required=False),
         ),
     ),
+    "REQUEST_HUMAN": Contract(
+        capability="REQUEST_HUMAN",
+        description="agents/whatsapp_reservations — customer wants a person, or the agent can't help; the backend pauses the bot in that chat and pushes the POS (no confirmation step)",
+        fields=(
+            FieldSpec("reason", str, required=True),
+        ),
+    ),
     "CREATE_RESERVATION": Contract(
         capability="CREATE_RESERVATION",
         description="agents/whatsapp_reservations — slot for a catalog service booked by a customer over WhatsApp",

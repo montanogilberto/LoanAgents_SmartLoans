@@ -1560,13 +1560,19 @@ async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> Wha
         app_name="loan_agents_whatsapp_reservations",
         user_id=user_id,
         session_id=user_id,
-        initial_state={"whatsapp_reservations_reply": ""},
+        # The session is keyed by company + branch + phone, so these never
+        # change for it. get_my_reward_points reads them from here — the
+        # phone is Meta's verified sender, never something the model chose.
+        initial_state={"whatsapp_reservations_reply": "",
+                       "wa_company_id": req.companyId,
+                       "wa_customer_phone": req.phone},
     )
     # Hermosillo is UTC-7 all year — same convention as tools/backend_api.py.
     now_local = datetime.now(timezone.utc) - timedelta(hours=7)
     context = {
         "companyId": req.companyId,
         "companyName": req.companyName,
+        "branchId": req.branchId,
         "branchName": req.branchName,
         "customerName": req.customerName,
         "today": now_local.date().isoformat(),
