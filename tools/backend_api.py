@@ -7,7 +7,9 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
-from config.settings import SMARTLOANS_BACKEND_URL
+from google.adk.tools import ToolContext
+
+from config.settings import SMARTLOANS_BACKEND_URL, WORKER_KEY
 
 _TIMEOUT = 15.0
 
@@ -666,3 +668,87 @@ def get_available_slots(company_id: int, date: str, reservation_service_id: int)
         return result
     rows = result.get("result", []) if isinstance(result, dict) else []
     return rows[0] if rows else {"error": "no availability returned"}
+
+
+# ── WhatsApp assistant content (smartloans_backend modules/whatsappAssistant.py) ──
+
+def get_promotions(company_id: int) -> list[dict]:
+    """Promotions active right now — the same promo codes the POS applies at
+    checkout (dbo.promotions), so anything shown here really works in store.
+
+    Args:
+        company_id: The business's company id (from the turn's context).
+
+    Returns:
+        [{"code": str, "name": str, "promoType": str, "description": str|None,
+        "startAtUtc": str|None, "endAtUtc": str|None}]. Empty = no promotions now.
+    """
+    result = _post("/promotions", {"promotions": [{"companyId": company_id, "activeOnly": True}]})
+    rows = result.get("result", []) if isinstance(result, dict) else []
+    promos = (rows[0].get("promotions") or []) if rows else []
+    return [{k: p.get(k) for k in ("code", "name", "promoType", "description", "startAtUtc", "endAtUtc")}
+            for p in promos]
+
+
+def get_business_info(company_id: int, branch_id: int | None = None) -> dict:
+    """The business's own info: address, maps link, phone, email, payment
+    methods, services/prices text and extra notes. Branch values override
+    the company-wide ones. Any field may be null = not provided.
+
+    Args:
+        company_id: The business's company id (from the turn's context).
+        branch_id: The branch id from the context, if any.
+    """
+    result = _post("/businessInfo", {"businessInfo": [{"companyId": company_id, "branchId": branch_id}]})
+    rows = result.get("result", []) if isinstance(result, dict) else []
+    info = (rows[0].get("businessInfo") or []) if rows else []
+    return info[0] if info else {}
+
+
+def get_faqs(company_id: int, branch_id: int | None = None) -> list[dict]:
+    """The business's frequently asked questions and their answers. Answer
+    general questions ONLY from these (and get_business_info).
+
+    Args:
+        company_id: The business's company id (from the turn's context).
+        branch_id: The branch id from the context, if any.
+
+    Returns:
+        [{"question": str, "answer": str}]
+    """
+    result = _post("/businessFaqs", {"businessFaqs": [
+        {"companyId": company_id, "branchId": branch_id, "activeOnly": True}]})
+    rows = result.get("result", []) if isinstance(result, dict) else []
+    faqs = (rows[0].get("businessFaqs") or []) if rows else []
+    return [{"question": f.get("question"), "answer": f.get("answer")} for f in faqs]
+
+
+def get_my_reward_points(tool_context: ToolContext) -> dict:
+    """The reward points of the customer writing on WhatsApp — ONLY theirs.
+    Takes no phone or client argument on purpose: the phone is the WhatsApp
+    sender's (set by the system in session state), so it can't be pointed
+    at someone else.
+
+    Returns:
+        {"status": "found", "firstName", "balance", "lifetimeEarned",
+         "redeemable": [{"name", "requiredPoints", "canRedeemNow", "description", ...}]}
+        {"status": "not_found"}  — no client with this phone at the business
+        {"status": "ambiguous"}  — several clients share it; a person must help
+        {"status": "unavailable"} — lookup failed
+    """
+    company_id = tool_context.state.get("wa_company_id")
+    phone = tool_context.state.get("wa_customer_phone")
+    if not company_id or not phone or not WORKER_KEY:
+        return {"status": "unavailable"}
+    try:
+        resp = httpx.post(f"{SMARTLOANS_BACKEND_URL}/whatsapp/assistant/customerRewards",
+                          json={"customerRewards": [{"companyId": company_id, "phone": phone}]},
+                          headers={"X-Worker-Key": WORKER_KEY}, timeout=_TIMEOUT)
+        resp.raise_for_status()
+        rows = resp.json().get("result") or []
+        row = rows[0] if rows else {}
+    except Exception:
+        return {"status": "unavailable"}
+    if row.get("status") != "found":
+        return {"status": row.get("status") or "unavailable"}
+    return {k: row.get(k) for k in ("status", "firstName", "balance", "lifetimeEarned", "redeemable")}

@@ -24,7 +24,8 @@ def test_whatsapp_reservations_agent_has_expected_tools():
     from agents.whatsapp_reservations.agent import whatsapp_reservations_agent
     tool_names = {t.func.__name__ for t in whatsapp_reservations_agent.tools if hasattr(t, "func")}
     assert tool_names == {"get_reservation_services", "get_reservation_hours",
-                          "get_available_slots", "propose_action"}
+                          "get_available_slots", "get_promotions", "get_business_info",
+                          "get_faqs", "get_my_reward_points", "propose_action"}
 
 
 def test_route_registered():
@@ -100,3 +101,54 @@ def test_route_starts_fresh_session_after_idle(monkeypatch):
     _call_route(monkeypatch, branchId=9, phone="+520000000009")
     fresh = asyncio.run(main._session_service.get_session(app_name=app, user_id=uid, session_id=uid))
     assert "marker" not in fresh.state
+
+
+# ── Assistant tools: handoff contract + points only for the sender ─────────
+
+def test_request_human_needs_a_reason():
+    assert CONTRACTS["REQUEST_HUMAN"].validate({"reason": "quiere hablar con alguien"}) == []
+    assert any("reason" in e for e in CONTRACTS["REQUEST_HUMAN"].validate({}))
+
+
+def test_my_reward_points_has_no_phone_parameter():
+    import inspect
+    from tools.backend_api import get_my_reward_points
+    assert list(inspect.signature(get_my_reward_points).parameters) == ["tool_context"]
+
+
+def test_my_reward_points_uses_session_phone_and_worker_key(monkeypatch):
+    from types import SimpleNamespace
+    from unittest import mock
+    import tools.backend_api as api
+
+    resp = mock.Mock()
+    resp.json.return_value = {"result": [{"status": "found", "clientId": 7, "firstName": "Ana",
+                                          "balance": 40, "lifetimeEarned": 90, "redeemable": []}]}
+    post = mock.Mock(return_value=resp)
+    monkeypatch.setattr(api, "WORKER_KEY", "secret")
+    monkeypatch.setattr(api.httpx, "post", post)
+    ctx = SimpleNamespace(state={"wa_company_id": 1, "wa_customer_phone": "+526621234567"})
+
+    out = api.get_my_reward_points(ctx)
+
+    assert out["balance"] == 40 and "clientId" not in out
+    assert post.call_args.kwargs["json"] == {"customerRewards": [{"companyId": 1, "phone": "+526621234567"}]}
+    assert post.call_args.kwargs["headers"] == {"X-Worker-Key": "secret"}
+
+
+def test_my_reward_points_unavailable_without_worker_key(monkeypatch):
+    from types import SimpleNamespace
+    import tools.backend_api as api
+    monkeypatch.setattr(api, "WORKER_KEY", "")
+    ctx = SimpleNamespace(state={"wa_company_id": 1, "wa_customer_phone": "+526621234567"})
+    assert api.get_my_reward_points(ctx) == {"status": "unavailable"}
+
+
+def test_route_stores_sender_phone_in_session_state(monkeypatch):
+    import asyncio
+    main, seen, _ = _call_route(monkeypatch, branchId=4, phone="+520000000044")
+    uid = seen["user_id"]
+    session = asyncio.run(main._session_service.get_session(
+        app_name="loan_agents_whatsapp_reservations", user_id=uid, session_id=uid))
+    assert session.state["wa_customer_phone"] == "+520000000044"
+    assert session.state["wa_company_id"] == 1
