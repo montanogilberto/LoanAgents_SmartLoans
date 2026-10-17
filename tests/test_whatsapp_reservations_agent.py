@@ -65,7 +65,10 @@ def _call_route(monkeypatch, **overrides):
 
     async def fake_run_async(*, user_id, session_id, new_message):
         seen["user_id"] = user_id
-        seen["message"] = new_message.parts[0].text
+        # setdefault: an empty turn is retried with an internal nudge — keep
+        # the customer's (first) message.
+        seen.setdefault("message", new_message.parts[0].text)
+        seen["calls"] = seen.get("calls", 0) + 1
         return
         yield  # async generator with no events
 
@@ -152,3 +155,16 @@ def test_route_stores_sender_phone_in_session_state(monkeypatch):
         app_name="loan_agents_whatsapp_reservations", user_id=uid, session_id=uid))
     assert session.state["wa_customer_phone"] == "+520000000044"
     assert session.state["wa_company_id"] == 1
+
+
+def test_empty_model_turn_never_returns_the_previous_reply(monkeypatch):
+    """Gemini sometimes ends a turn empty (a bare "3" after the menu); the
+    route used to return the PREVIOUS turn's text from session.state."""
+    import asyncio
+    main, seen, _ = _call_route(monkeypatch, branchId=5, phone="+520000000055")
+    uid = seen["user_id"]
+    stored = main._session_service.sessions["loan_agents_whatsapp_reservations"][uid][uid]
+    stored.state["whatsapp_reservations_reply"] = "MENU DEL TURNO ANTERIOR"
+    _, seen2, resp = _call_route(monkeypatch, branchId=5, phone="+520000000055")
+    assert resp.reply != "MENU DEL TURNO ANTERIOR"
+    assert seen2["calls"] == 2  # retried once before falling back

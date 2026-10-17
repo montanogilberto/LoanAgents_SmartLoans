@@ -1585,14 +1585,28 @@ async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> Wha
     }
     message = Content(role="user", parts=[Part(text=f"{req.message}\n\nContext: {json.dumps(context, ensure_ascii=False)}")])
 
+    # The reply is read from THIS turn's final events, never from
+    # session.state: when Gemini ends a turn with an empty response (seen with
+    # a bare "3" after the menu), output_key keeps the PREVIOUS turn's text and
+    # the customer got the old message again — every answer one turn late.
+    # One retry with an internal nudge recovers the empty turn.
     pending_raw = None
-    async for event in _whatsapp_reservations_runner.run_async(user_id=user_id, session_id=session.id, new_message=message):
-        delta = event.actions.state_delta if event.actions else {}
-        if "pending_action" in delta:
-            pending_raw = delta["pending_action"]
+    reply = ""
+    for attempt in range(2):
+        async for event in _whatsapp_reservations_runner.run_async(user_id=user_id, session_id=session.id, new_message=message):
+            delta = event.actions.state_delta if event.actions else {}
+            if "pending_action" in delta:
+                pending_raw = delta["pending_action"]
+            if event.is_final_response() and event.content and event.content.parts:
+                text = "".join(p.text or "" for p in event.content.parts if not getattr(p, "thought", False)).strip()
+                if text:
+                    reply = text
+        if reply:
+            break
+        message = Content(role="user", parts=[Part(text=(
+            "(Mensaje interno del sistema, no del cliente: tu respuesta anterior quedó vacía. "
+            "Responde ahora al último mensaje del cliente siguiendo tus instrucciones.)"))])
 
-    updated = await _session_service.get_session(app_name="loan_agents_whatsapp_reservations", user_id=user_id, session_id=session.id)
-    reply = updated.state.get("whatsapp_reservations_reply", "").strip()
     if not reply:
         reply = "No pude generar una respuesta en este momento. Intenta de nuevo."
     pending_action = PendingAction(**pending_raw) if isinstance(pending_raw, dict) else None
