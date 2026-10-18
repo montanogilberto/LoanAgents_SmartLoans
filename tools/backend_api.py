@@ -729,9 +729,18 @@ def get_my_reward_points(tool_context: ToolContext) -> dict:
     sender's (set by the system in session state), so it can't be pointed
     at someone else.
 
+    Two kinds of reward, judged differently (canRedeemNow already does it):
+      - points rewards (rewardType "discount_fixed" / "discount_pct"): need
+        requiredPoints from the balance;
+      - stamp cards (rewardType "free_product", "compra 3, el 4to gratis"):
+        need requiredUnits purchases of that product (unitsAvailable bought so
+        far) — points don't count for them.
+    Coupons (2X1) are not listed here; they're in get_promotions.
+
     Returns:
         {"status": "found", "firstName", "balance", "lifetimeEarned",
-         "redeemable": [{"name", "requiredPoints", "canRedeemNow", "description", ...}]}
+         "redeemable": [{"name", "rewardType", "requiredPoints", "discountValue",
+                         "requiredUnits", "unitsAvailable", "canRedeemNow", "description"}]}
         {"status": "not_found"}  — no client with this phone at the business
         {"status": "ambiguous"}  — several clients share it; a person must help
         {"status": "unavailable"} — lookup failed
