@@ -1608,7 +1608,7 @@ async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> Wha
             "Responde ahora al último mensaje del cliente siguiendo tus instrucciones.)"))])
 
     if not reply:
-        reply = "No pude generar una respuesta en este momento. Intenta de nuevo."
+        reply = "Perdón, se me complicó responderte. ¿Me lo puedes escribir de otra forma?"
     pending_action = PendingAction(**pending_raw) if isinstance(pending_raw, dict) else None
     return WhatsAppReservationsResponse(reply=reply, pendingAction=pending_action)
 
