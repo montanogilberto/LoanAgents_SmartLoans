@@ -156,6 +156,11 @@ CONTRACTS: dict[str, Contract] = {
             FieldSpec("reason", str, required=True),
         ),
     ),
+    "SEND_CLIENT_QR": Contract(
+        capability="SEND_CLIENT_QR",
+        description="agents/whatsapp_reservations — the sender's own client QR (CLIENT:<id>:<name>, the one the POS scanner reads); the backend matches the client by the WhatsApp phone and sends the image (no confirmation step)",
+        fields=(),
+    ),
     "CREATE_RESERVATION": Contract(
         capability="CREATE_RESERVATION",
         description="agents/whatsapp_reservations — slot for a catalog service booked by a customer over WhatsApp",

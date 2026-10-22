@@ -15,8 +15,8 @@ whatsapp_reservations_agent = Agent(
         "WhatsApp assistant for a business's customers — reservations (catalog "
         "services + real free slots; PROPOSES, the backend books after \"sí\"), "
         "opening hours, the promotions the POS applies, business info and FAQs, "
-        "the sender's own reward points, and handing off to a person "
-        "(REQUEST_HUMAN). Answers business facts only from tools."
+        "the sender's own reward points and client QR (SEND_CLIENT_QR), and "
+        "handing off to a person (REQUEST_HUMAN). Answers business facts only from tools."
     ),
     model="gemini-2.5-flash",
     instruction=lambda _ctx: INSTRUCTION,
