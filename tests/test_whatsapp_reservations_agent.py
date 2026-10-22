@@ -113,6 +113,21 @@ def test_request_human_needs_a_reason():
     assert any("reason" in e for e in CONTRACTS["REQUEST_HUMAN"].validate({}))
 
 
+def test_send_client_qr_takes_no_fields():
+    # The backend matches the client by the WhatsApp sender's phone; nothing
+    # the agent passes decides whose QR goes out.
+    assert CONTRACTS["SEND_CLIENT_QR"].fields == ()
+    assert CONTRACTS["SEND_CLIENT_QR"].validate({}) == []
+
+
+def test_menu_offers_the_qr_as_option_7():
+    from agents.whatsapp_reservations.prompt import INSTRUCTION, MENU
+    assert "7️⃣ Mi código QR de cliente" in MENU
+    assert "6️⃣ Hablar con alguien del equipo" in MENU  # 6 still means a person
+    assert "7 their QR (SEND_CLIENT_QR)" in INSTRUCTION
+    assert 'propose_action(capability="SEND_CLIENT_QR"' in INSTRUCTION
+
+
 def test_my_reward_points_has_no_phone_parameter():
     import inspect
     from tools.backend_api import get_my_reward_points
