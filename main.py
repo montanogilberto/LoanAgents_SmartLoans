@@ -37,7 +37,7 @@ from agents import (
 from agents.support import support_agent
 from agents.ticket_extraction.matching import UNAVAILABLE, match_product, match_supplier
 from agents.ticket_extraction.proposal import build_proposal, evaluate
-from agents.ticket_extraction.reconcile import payment_label, reconcile
+from agents.ticket_extraction.reconcile import normalize_line_items, payment_label, reconcile
 from agents.product_extraction.reconcile import reconcile as reconcile_product_label
 from config.settings import PORT
 from intake_api import router as intake_router
@@ -916,10 +916,12 @@ class RecordMatch(BaseModel):
 
 
 class TicketLineItemOut(BaseModel):
-    name: str = ""
+    code: str = ""             # store item code printed with the line ("" if none)
+    name: str = ""             # description without that code
     quantity: float = 1.0
     unitPrice: float = 0.0
-    lineTotal: float = 0.0
+    lineTotal: float = 0.0     # printed amount, before the promotion
+    discount: float = 0.0      # promotion folded in from the line below (positive)
     needsReview: bool = False
     productMatch: RecordMatch = RecordMatch()
 
@@ -942,9 +944,11 @@ class ProposalSupplier(BaseModel):
 class ProposalLine(BaseModel):
     index: int = 0
     ticketName: str = ""
+    code: str = ""             # item code read off the ticket; saved as the new product's barCode
     quantity: float = 1.0
-    unitCost: float = 0.0      # purchase cost PER UNIT
-    lineTotal: float = 0.0
+    unitCost: float = 0.0      # purchase cost PER UNIT, after the promotion
+    lineTotal: float = 0.0     # net: printed amount − discount
+    discount: float = 0.0
     action: str = "choose"     # use | create | choose
     productId: int | None = None
     name: str = ""
@@ -1013,10 +1017,11 @@ def _build_ticket_response(
 ) -> ExtractTicketResponse:
     """Post-processing between the model's JSON and the API response: code-side
     checks (reconcile), payment label, date blanking. Pure — no I/O."""
+    normalize_line_items(result)
     checks = reconcile(result)
     payment_type = str(result.get("paymentType", "NO_VISIBLE") or "NO_VISIBLE")
     merchant_name = str(result.get("merchantName", "") or "")
-    raw_items = [i for i in result.get("lineItems", []) if isinstance(i, dict)]
+    raw_items = result["lineItems"]
     supplier_match = supplier_match or RecordMatch()
     if product_matches is None:
         product_matches = [RecordMatch() for _ in raw_items]
@@ -1039,10 +1044,12 @@ def _build_ticket_response(
         supplierMatch=supplier_match,
         lineItems=[
             TicketLineItemOut(
-                name=str(i.get("name", "") or ""),
+                code=i["code"],
+                name=i["name"],
                 quantity=float(i.get("quantity", 1.0) or 0.0),
                 unitPrice=float(i.get("unitPrice", 0.0) or 0.0),
                 lineTotal=float(i.get("lineTotal", 0.0) or 0.0),
+                discount=float(i.get("discount", 0.0) or 0.0),
                 needsReview=bool(i.get("needsReview", False)),
                 productMatch=match,
             )
@@ -1113,7 +1120,7 @@ async def extract_expense_ticket(req: ExtractTicketRequest) -> ExtractTicketResp
         return _build_ticket_response(result)
 
     merchant_name = str(result.get("merchantName", "") or "")
-    raw_items = [i for i in result.get("lineItems", []) if isinstance(i, dict)]
+    raw_items = normalize_line_items(result)
 
     supplier_match = RecordMatch()
     product_matches = [RecordMatch() for _ in raw_items]
@@ -1132,7 +1139,7 @@ async def extract_expense_ticket(req: ExtractTicketRequest) -> ExtractTicketResp
         if isinstance(products, Exception):
             logger.warning("extract-ticket: product lookup failed: %s", products)
         else:
-            product_matches = [RecordMatch(**match_product(str(i.get("name", "") or ""), products)) for i in raw_items]
+            product_matches = [RecordMatch(**match_product(i["name"], products, i["code"])) for i in raw_items]
 
     return _build_ticket_response(result, supplier_match, product_matches)
 

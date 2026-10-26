@@ -12,6 +12,7 @@ an ambiguous or unavailable match is NEVER auto-selected. The POS app only
 displays this and applies the person's edits.
 """
 from agents.ticket_extraction.matching import MATCHED, NEW, AMBIGUOUS
+from agents.ticket_extraction.reconcile import net_line_total
 
 USE = "use"
 CREATE = "create"
@@ -33,7 +34,10 @@ def _quantity(line: dict) -> float:
 
 def unit_cost(line: dict) -> float:
     """Purchase cost PER UNIT: the printed unit price when there is one, else
-    the line total divided by the quantity."""
+    the line total divided by the quantity. A promotion on the line lowers it:
+    (amount − discount) ÷ quantity."""
+    if float(line.get("discount") or 0) > 0:
+        return _round2(net_line_total(line) / _quantity(line))
     unit_price = float(line.get("unitPrice") or 0)
     if unit_price > 0:
         return _round2(unit_price)
@@ -72,12 +76,16 @@ def build_proposal(response: dict) -> dict:
             action, product_id, final_name = CREATE, None, name
         else:
             action, product_id, final_name = CHOOSE, None, name
+        code = str(line.get("code") or "").strip()
         lines.append({
             "index": index,
-            "ticketName": str(line.get("name") or ""),
+            # As printed (code + description); `name` is what to register.
+            "ticketName": f"{code} {name}".strip() if code else str(line.get("name") or ""),
+            "code": code,
             "quantity": _quantity(line),
             "unitCost": unit_cost(line),
-            "lineTotal": _round2(line.get("lineTotal") or 0),
+            "lineTotal": net_line_total(line),
+            "discount": _round2(line.get("discount") or 0),
             "action": action,
             "productId": product_id,
             "name": final_name,
