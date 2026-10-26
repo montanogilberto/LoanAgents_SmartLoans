@@ -13,6 +13,7 @@ from agents.cash_register import cash_register_agent
 from agents.expense import expense_agent
 from agents.ticket_extraction import ticket_extraction_agent
 from agents.product_extraction import product_extraction_agent
+from agents.product_web_lookup import product_web_lookup_agent
 from agents.client_followup import client_followup_agent
 from agents.order_triage import order_triage_agent
 from agents.pos_clients_support import pos_clients_support_agent
@@ -40,6 +41,7 @@ __all__ = [
     "expense_agent",
     "ticket_extraction_agent",
     "product_extraction_agent",
+    "product_web_lookup_agent",
     "client_followup_agent",
     "order_triage_agent",
     "pos_clients_support_agent",

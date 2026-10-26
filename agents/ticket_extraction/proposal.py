@@ -11,7 +11,7 @@ POST /expenses/extract-ticket returns) — no I/O, no Gemini, nothing invented:
 an ambiguous or unavailable match is NEVER auto-selected. The POS app only
 displays this and applies the person's edits.
 """
-from agents.ticket_extraction.matching import MATCHED, NEW, AMBIGUOUS
+from agents.ticket_extraction.matching import MATCHED, NEW, AMBIGUOUS, parse_pack
 from agents.ticket_extraction.reconcile import net_line_total
 
 USE = "use"
@@ -91,6 +91,9 @@ def build_proposal(response: dict) -> dict:
             "name": final_name,
             "candidates": _candidates(match),
             "needsReview": bool(line.get("needsReview")),
+            # Breakdown of the presentation as printed: 45/500ML → 45 × 500 ml.
+            # quantity/unitCost stay per PACK; the app converts to pieces on save.
+            **parse_pack(name),
         })
 
     total = float(response.get("total") or 0)

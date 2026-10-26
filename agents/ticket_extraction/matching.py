@@ -201,3 +201,38 @@ def match_product(name: str, products: list[dict], code: str = "") -> dict:
             score = min(score, CANDIDATE_THRESHOLD - 0.01)
         scored.append((score, p, label))
     return _decide(scored, "productId")
+
+
+# ── Pack breakdown ("desglose") of a ticket description ──────────────────────
+# Wholesale tickets abbreviate the presentation: "45/500ML AGU" is 45 pieces of
+# 500 ml, "8L ARIEL" one 8 L bottle, "10K 123 JAZM" a 10 kg bag. Read in code (not
+# by the model) so the same text always gives the same breakdown.
+_UNIT_TOKEN = r"(ML|MLS|LTS?|L|KGS?|K|GRS?|G)"
+_NUM = r"(\d+(?:[.,]\d+)?)"
+_PACK_SLASH = re.compile(rf"\b(\d+)\s*/\s*{_NUM}\s*{_UNIT_TOKEN}\b")        # 45/500ML
+_PACK_TIMES = re.compile(rf"\b(\d+)\s*[X×]\s*{_NUM}\s*{_UNIT_TOKEN}\b")     # 12X355ML
+_SIZE_ONLY = re.compile(rf"(?<![\d.,/]){_NUM}\s*{_UNIT_TOKEN}\b")           # 8L, 10K, 2.8 L
+_COUNT_ONLY = re.compile(r"(?:\bC/\s*(\d+)\b|\b(\d+)\s*(?:PZAS?|PZS?|PIEZAS|PK|PACK)\b)")  # C/24, 24 PZAS
+# POS units (the product form offers g, kg, ml, L, pz).
+_POS_UNIT = {"ML": "ml", "MLS": "ml", "L": "L", "LT": "L", "LTS": "L",
+             "G": "g", "GR": "g", "GRS": "g", "K": "kg", "KG": "kg", "KGS": "kg"}
+
+
+def parse_pack(name: str) -> dict:
+    """{"unitsPerPack": int, "netContent": float, "unitOfMeasure": str} read off a
+    ticket description. unitsPerPack is 1 and netContent 0.0 / unitOfMeasure ""
+    when the text does not state them — never inferred from the product name."""
+    text = unicodedata.normalize("NFKD", str(name or "")).encode("ascii", "ignore").decode().upper()
+    units, content, unit = 1, 0.0, ""
+    m = _PACK_SLASH.search(text) or _PACK_TIMES.search(text)
+    if m:
+        units = int(m.group(1))
+        content, unit = float(m.group(2).replace(",", ".")), _POS_UNIT[m.group(3)]
+    else:
+        size = _SIZE_ONLY.search(text)
+        if size:
+            content, unit = float(size.group(1).replace(",", ".")), _POS_UNIT[size.group(2)]
+        count = _COUNT_ONLY.search(text)
+        if count:
+            units = int(count.group(1) or count.group(2))
+    return {"unitsPerPack": max(units, 1), "netContent": content, "unitOfMeasure": unit}
