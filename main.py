@@ -1283,6 +1283,10 @@ class ProductWebLookupRequest(BaseModel):
     # When given, the result is matched against this company's products so the
     # app can offer the existing one instead of creating a duplicate.
     companyId: int | None = None
+    # Where the buyer is: sources and the price are looked up for this country /
+    # currency. Mexico is the default; other countries just send theirs.
+    country: str = "MX"
+    currency: str = "MXN"
 
 
 class WebSource(BaseModel):
@@ -1300,11 +1304,15 @@ class ProductWebLookupResponse(BaseModel):
     brand: str = ""
     productName: str = ""
     variant: str = ""
+    # Generic kind in Spanish ("Detergente"): the app files the product under the
+    # subcategory of that name (created under Productos if missing, on confirm).
+    productType: str = ""
     description: str = ""
     netContent: float = 0.0      # per piece
     unitOfMeasure: str = ""      # g | kg | ml | L | pz | ""
     unitsPerPack: int = 1
-    price: float = 0.0           # price the source shows, reference only
+    price: float = 0.0           # in `currency`; reference only, 0 when none
+    currency: str = "MXN"
     sources: list[WebSource] = []
     existingProduct: RecordMatch = RecordMatch()
     issues: list[str] = []
@@ -1318,8 +1326,8 @@ async def _web_lookup_raw(req: ProductWebLookupRequest) -> tuple[dict, list[dict
     user_id = f"product-web-{uuid.uuid4()}"
     session = await _session_service.create_session(
         app_name="loan_agents_product_web", user_id=user_id, session_id=str(uuid.uuid4()))
-    query = json.dumps({"store": req.merchantName, "itemCode": req.code, "ticketDescription": req.ticketName},
-                       ensure_ascii=False)
+    query = json.dumps({"store": req.merchantName, "itemCode": req.code, "ticketDescription": req.ticketName,
+                        "country": req.country, "currency": req.currency}, ensure_ascii=False)
     text, sources, seen = "", [], set()
     async for event in _product_web_lookup_runner.run_async(
             user_id=user_id, session_id=session.id, new_message=Content(role="user", parts=[Part(text=query)])):
@@ -1365,7 +1373,7 @@ async def product_web_lookup(req: ProductWebLookupRequest) -> ProductWebLookupRe
                 checked["issues"].append(f"Ya existe en tu catálogo como «{match.name}» (#{match.id}).")
                 checked["needsReview"] = True
 
-    return ProductWebLookupResponse(**checked, existingProduct=existing)
+    return ProductWebLookupResponse(**checked, existingProduct=existing, currency=req.currency)
 
 
 class ClientFollowUpSuggestionRequest(BaseModel):

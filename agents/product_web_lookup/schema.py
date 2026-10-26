@@ -13,6 +13,7 @@ class WebProductResult(BaseModel):
     brand: str = ""
     productName: str = ""      # what it is ("Agua Purificada"), without brand/variant
     variant: str = ""          # flavor / scent / presentation, "" if none
+    productType: str = ""      # generic kind, Spanish singular ("Detergente") → catalog subcategory
     description: str = ""      # 1-2 Spanish sentences from the source
     netContent: float = 0.0    # per piece (500 for a pack of 45 × 500 ml)
     unitOfMeasure: str = ""    # g | kg | ml | L | pz | ""

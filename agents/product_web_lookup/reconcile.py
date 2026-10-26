@@ -33,8 +33,13 @@ def _same_size(a: float, unit_a: str, b: float, unit_b: str) -> bool:
 def suggested_name(r: dict) -> str:
     """Name for the POS catalog: brand + product + variant + size of ONE piece
     ("Member's Mark Agua Purificada 500 ml"); the full title when not split."""
-    parts = [r["brand"], r["productName"], r["variant"]]
-    base = " ".join(p.strip() for p in parts if p and p.strip())
+    words: list[str] = []
+    for part in (r["brand"], r["productName"], r["variant"]):
+        for word in str(part or "").split():
+            # "Refresco Original" + variant "Original" → once.
+            if word.lower() not in {w.lower() for w in words}:
+                words.append(word)
+    base = " ".join(words)
     if not r["productName"]:
         base = r["fullName"].strip()
     if base and r["netContent"] > 0 and r["unitOfMeasure"] and r["unitOfMeasure"] != "pz":
@@ -78,6 +83,9 @@ def reconcile_web_lookup(raw: dict, sources: list[dict], ticket_pack: dict | Non
     r["price"] = max(float(r["price"] or 0), 0.0)
     if not r["unitOfMeasure"]:
         r["netContent"] = 0.0
+    # "detergentes en polvo" / "DETERGENTE" → "Detergentes en polvo" / "Detergente": one spelling per kind.
+    kind = " ".join(r["productType"].split())[:50]
+    r["productType"] = kind[:1].upper() + kind[1:].lower() if kind else ""
     issues = [str(n) for n in r.pop("notes") if str(n).strip()]
 
     if not r["found"]:
