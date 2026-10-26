@@ -65,6 +65,20 @@ def test_new_merchant_and_new_products_are_proposed_for_creation():
     assert p["lines"][0]["productId"] is None and p["lines"][0]["name"] == "Jabón Member's Mark 5 L"
 
 
+def test_item_code_is_returned_apart_and_ticket_name_keeps_it():
+    resp = clear(lineItems=[line("AXION ROSAS", status="NEW", code="981055673")])
+    l = build_proposal(resp)["lines"][0]
+    assert (l["code"], l["name"], l["ticketName"], l["action"]) == ("981055673", "AXION ROSAS", "981055673 AXION ROSAS", "create")
+    assert build_proposal(clear())["lines"][0]["code"] == ""
+
+
+def test_a_promotion_lowers_the_unit_cost_and_the_line_total():
+    l = build_proposal(clear(lineItems=[line("8L ARIEL REG", status="NEW", qty=1, total=347.82, discount=42.97)]))["lines"][0]
+    assert (l["unitCost"], l["lineTotal"], l["discount"]) == (304.85, 304.85, 42.97)
+    two = build_proposal(clear(lineItems=[line("SUAVITEL", status="NEW", qty=2, total=439.88, unit_price=219.94, discount=20.0)]))["lines"][0]
+    assert (two["unitCost"], two["lineTotal"]) == (209.94, 419.88)
+
+
 def test_ambiguous_or_unavailable_matches_are_never_auto_selected():
     cands = [{"id": 1, "name": "A", "score": 0.8}, {"id": 2, "name": "B", "score": 0.79}]
     p = build_proposal(clear(

@@ -153,16 +153,42 @@ def match_supplier(name: str, suppliers: list[dict]) -> dict:
     return _decide(scored, "supplierId")
 
 
+# A leading run of 4+ digits followed by the description: "981055673 AXION ROSAS".
+# Sizes/quantities never match ("45/500ML AGU", "10K 123 JAZM", "8L ARIEL").
+_LEADING_CODE = re.compile(r"^\s*(\d{4,})\s+(\S.*)$")
+
+
+def split_line_code(code: str, name: str) -> tuple[str, str]:
+    """(code, name) for a ticket line. The model is told to return the store's
+    item code apart from the description; this is the deterministic backstop
+    for when it does not: a leading 4+ digit token moves from name to code."""
+    code, name = str(code or "").strip(), str(name or "").strip()
+    if code:
+        if name.startswith(code + " "):
+            name = name[len(code):].strip()
+        return code, name
+    m = _LEADING_CODE.match(name)
+    return (m.group(1), m.group(2).strip()) if m else ("", name)
+
+
 def _product_tokens(name: str) -> tuple[set[str], list[str]]:
     sizes, rest = _sizes(re.sub(r"(\d)\s*,\s*(\d)", r"\1.\2", _base_normalize(name)))
     tokens = [t for t in re.sub(r"[.,]", " ", rest).split() if t not in _STOPWORDS]
     return sizes, tokens
 
 
-def match_product(name: str, products: list[dict]) -> dict:
-    """Maps a ticket line description to one of the company's products. If
+def match_product(name: str, products: list[dict], code: str = "") -> dict:
+    """Maps a ticket line to one of the company's products. An exact item code
+    (stored on the product as barCode) wins outright; otherwise the name. If
     both names state a size and the sizes differ, the pair is capped below
     the candidate threshold (different pack sizes are different products)."""
+    code = str(code or "").strip()
+    if code:
+        for p in products:
+            if str(p.get("barCode") or "").strip() == code:
+                label = str(p.get("name") or "")
+                return {"status": MATCHED, "id": p.get("productId"), "name": label, "score": 1.0,
+                        "candidates": [{"id": p.get("productId"), "name": label, "score": 1.0}]}
     wanted_sizes, wanted = _product_tokens(name)
     if not wanted:
         return {"status": UNAVAILABLE, "id": None, "name": "", "score": 0.0, "candidates": []}

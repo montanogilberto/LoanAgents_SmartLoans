@@ -4,7 +4,10 @@ The model transcribes; this code does the arithmetic and date sanity checks,
 so a misread digit surfaces as an issue for the reviewer instead of silently
 pre-filling the form. Pure functions — no I/O, no Gemini.
 """
+import re
 from datetime import date, datetime, timedelta, timezone
+
+from agents.ticket_extraction.matching import split_line_code
 
 # Totals/lines within one peso count as matching (same tolerance the
 # transfer-evidence agent uses for amounts).
@@ -42,6 +45,65 @@ def _today(now: datetime | None = None) -> date:
     return (now - _HERMOSILLO_OFFSET).date()
 
 
+# A promotion/discount line the model returned as an item instead of folding it.
+_PROMO = re.compile(r"\b(promo\w*|descuento|desc|ahorro|rebaja|bonificaci\w*)\b", re.IGNORECASE)
+
+
+def _is_discount_line(item: dict) -> bool:
+    if _num(item.get("lineTotal")) < 0:
+        return True
+    name = str(item.get("name") or "")
+    return bool(_PROMO.search(name)) and not str(item.get("code") or "").strip()
+
+
+def normalize_line_items(result: dict) -> list[dict]:
+    """Deterministic clean-up of the model's lines, in place and idempotent:
+    the store item code moves out of the name, and a promotion/discount line
+    ("Promocion Especial -42.97", negative amount) is folded into the item
+    printed above it as that item's `discount` instead of being a product."""
+    items: list[dict] = []
+    for raw in result.get("lineItems", []) or []:
+        if not isinstance(raw, dict):
+            continue
+        raw["code"], raw["name"] = split_line_code(raw.get("code", ""), raw.get("name", ""))
+        raw["discount"] = abs(_num(raw.get("discount")))
+        if items and _is_discount_line(raw):
+            prev = items[-1]
+            prev["discount"] = round(_num(prev.get("discount")) + abs(_num(raw.get("lineTotal"))), 2)
+            continue
+        items.append(raw)
+    result["lineItems"] = items
+    return items
+
+
+def net_line_total(item: dict) -> float:
+    """What the line actually cost: the printed amount minus its promotion."""
+    line = _num(item.get("lineTotal"))
+    if line <= 0:
+        line = _num(item.get("quantity")) * _num(item.get("unitPrice"))
+    return round(line - _num(item.get("discount")), 2)
+
+
+def date_from_timestamp(raw: str, now: datetime | None = None) -> str:
+    """Decodes a stamp like "TS:221026153017" (6 date digits + time) into an
+    ISO date. The digit order varies by store, so both DDMMYY and YYMMDD are
+    tried and the most recent valid, non-future reading wins. "" if none."""
+    digits = re.sub(r"\D", "", str(raw or ""))
+    if len(digits) < 6:
+        return ""
+    d = digits[:6]
+    today = _today(now)
+    readings = []
+    for day, month, year in ((d[0:2], d[2:4], d[4:6]), (d[4:6], d[2:4], d[0:2])):
+        try:
+            parsed = date(2000 + int(year), int(month), int(day))
+        except ValueError:
+            continue
+        if parsed <= today + timedelta(days=1):
+            readings.append(parsed)
+    return max(readings).isoformat() if readings else ""
+
+
 def payment_label(payment_type: str) -> str:
     return PAYMENT_LABELS.get(str(payment_type or "").upper(), "")
 
@@ -56,7 +118,7 @@ def reconcile(result: dict, now: datetime | None = None) -> dict:
     subtotal = _num(result.get("subtotal"))
     tax = _num(result.get("tax"))
 
-    items_total = round(sum(_num(i.get("lineTotal")) for i in items), 2)
+    items_total = round(sum(net_line_total(i) for i in items), 2)
     total_matches: bool | None = None
 
     if items and total > 0:
@@ -81,6 +143,7 @@ def reconcile(result: dict, now: datetime | None = None) -> dict:
         )
 
     for item in items:
+        # unitPrice × quantity is checked against the printed amount BEFORE the promotion.
         qty, unit, line = _num(item.get("quantity")), _num(item.get("unitPrice")), _num(item.get("lineTotal"))
         name = str(item.get("name") or "").strip() or "(sin nombre)"
         if qty > 0 and unit > 0 and abs(qty * unit - line) > TOLERANCE:
@@ -89,6 +152,10 @@ def reconcile(result: dict, now: datetime | None = None) -> dict:
             issues.append(f"'{name}': renglón poco legible, revisar.")
 
     ticket_date = str(result.get("ticketDate") or "")
+    if not ticket_date and result.get("timestampRaw"):
+        ticket_date = date_from_timestamp(result.get("timestampRaw"), now)
+        if ticket_date:
+            issues.append("La fecha se tomó del sello del ticket (TS); confírmala.")
     if ticket_date:
         try:
             parsed = date.fromisoformat(ticket_date)

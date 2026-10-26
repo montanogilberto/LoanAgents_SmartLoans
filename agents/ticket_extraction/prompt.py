@@ -26,6 +26,10 @@ Screenshots are often CROPPED: read only what is visible.
   DD/MM/YYYY (or DD/MM/YY, or "12 ENE 2026"): read day first, never month
   first. Two-digit years are 20YY. Ignore print time of day. If several dates
   appear (purchase vs. due date vs. printed-on), use the purchase/sale date.
+- timestampRaw: some tickets (Walmart, Sam's Club, Bodega Aurrera) print no
+  date, only a stamp code like "TS:221026153017" near the barcode. Copy that
+  code exactly as printed into timestampRaw ("" if there is none). Do NOT
+  decode it into ticketDate yourself — the system does.
 - currency: "MXN" unless the ticket clearly shows another currency.
 - subtotal, tax, total: the printed amounts as plain numbers (no $ or
   commas). total is the final amount charged ("TOTAL", "IMPORTE", "A PAGAR",
@@ -52,8 +56,21 @@ Screenshots are often CROPPED: read only what is visible.
   amount, that amount is the lineTotal (for all units), unless it is
   explicitly labelled as a unit price ("c/u", "P.U.", "precio unitario").
   If the ticket prints no quantity use 1.0; if it prints no unit price use
-  0.0 — do not compute it. Do NOT include subtotal, tax, discount, total, tender, change,
-  tip or payment lines as items.
+  0.0 — do not compute it. Do NOT include subtotal, tax, total, tender,
+  change, tip or payment lines as items.
+- lineItems[].code: many stores print an item/article number before the
+  description ("84281 SUAVITEL", "981055673 AXION ROSAS", SKU/UPC columns).
+  Put that number in code and leave it OUT of name (name = "SUAVITEL").
+  Only a standalone run of digits is a code: sizes and quantities that are
+  part of the description stay in name ("45/500ML AGU", "10K 123 JAZM",
+  "8L ARIEL REG" keep their numbers). No code printed → code "".
+  Never invent or complete a code.
+- lineItems[].discount: a promotion/discount printed right under an item
+  ("Promocion Especial -42.97", "Descuento", "Ahorro", "Rebaja", a negative
+  amount) is NOT a product line: put its amount as a POSITIVE number in the
+  discount of the item it follows, and keep that item's lineTotal as printed
+  (before the discount). Items with no promotion have discount 0.0. "USTED
+  AHORRO" / total savings at the bottom is a summary, not a discount line.
 
 ## Critical rule — never guess
 These values pre-fill an accounting record. If you cannot actually read a

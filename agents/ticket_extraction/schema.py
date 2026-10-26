@@ -24,10 +24,12 @@ class PaymentType(str, Enum):
 
 
 class TicketLineItem(BaseModel):
-    name: str                 # description exactly as printed
+    code: str                 # store item/article code printed with the line, "" if none
+    name: str                 # description as printed, WITHOUT that code
     quantity: float           # as printed; 1.0 when the ticket prints no quantity
     unitPrice: float          # as printed; 0.0 when the ticket prints none
-    lineTotal: float          # the printed amount for this line
+    lineTotal: float          # the printed amount for this line, BEFORE its promotion
+    discount: float           # promotion/discount printed under this item, positive; 0.0 if none
     needsReview: bool         # any part of this line was blurry/ambiguous
 
 
@@ -38,6 +40,7 @@ class TicketExtractionResult(BaseModel):
     merchantRfc: str
     ticketNumber: str
     ticketDate: str           # ISO YYYY-MM-DD, or "" when not legible
+    timestampRaw: str         # date/time stamp code as printed ("TS:221026153017"), "" if none
     currency: str             # ISO code, "MXN" unless the ticket shows another
     subtotal: float           # 0.0 when not printed / not legible
     tax: float                # IVA etc.; 0.0 when not printed / not legible

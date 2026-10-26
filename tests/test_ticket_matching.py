@@ -12,7 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from agents.ticket_extraction.matching import (
-    AMBIGUOUS, MATCHED, NEW, UNAVAILABLE, match_product, match_supplier,
+    AMBIGUOUS, MATCHED, NEW, UNAVAILABLE, match_product, match_supplier, split_line_code,
 )
 
 SUPPLIERS = [
@@ -72,6 +72,28 @@ def test_product_superset_name_is_not_auto_matched():
 
 def test_product_new():
     assert match_product("Papel higiénico 12 rollos", PRODUCTS)["status"] == NEW
+
+
+def test_split_line_code_moves_a_leading_item_number_out_of_the_name():
+    assert split_line_code("", "981055673 AXION ROSAS") == ("981055673", "AXION ROSAS")
+    assert split_line_code("", "980027611 8L ARIEL REG") == ("980027611", "8L ARIEL REG")
+    assert split_line_code("84281", "84281 SUAVITEL") == ("84281", "SUAVITEL")
+    assert split_line_code("84281", "SUAVITEL") == ("84281", "SUAVITEL")
+
+
+def test_split_line_code_leaves_sizes_and_short_numbers_in_the_name():
+    assert split_line_code("", "45/500ML AGU") == ("", "45/500ML AGU")
+    assert split_line_code("", "10K 123 JAZM") == ("", "10K 123 JAZM")
+    assert split_line_code("", "123 JAZM") == ("", "123 JAZM")
+    assert split_line_code("", "SUAVITEL") == ("", "SUAVITEL")
+
+
+def test_product_exact_item_code_wins_over_the_name():
+    products = PRODUCTS + [{"productId": 20, "name": "Axion Lavatrastes Rosas 1.1 L", "barCode": "981055673"}]
+    m = match_product("AXION ROSAS", products, "981055673")
+    assert (m["status"], m["id"], m["score"]) == (MATCHED, 20, 1.0)
+    # an unknown code falls back to the name matcher
+    assert match_product("Detergente Líquido Ariel RevitaColor 8.5 L", PRODUCTS, "999999")["id"] == 10
 
 
 def test_list_tools_filter_to_company(monkeypatch):
