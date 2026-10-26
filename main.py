@@ -33,12 +33,14 @@ from agents import (
     ticket_extraction_agent, client_followup_agent, order_triage_agent, pos_clients_support_agent,
     pos_income_support_agent, pos_expenses_support_agent, pos_accounting_support_agent,
     pos_rewards_support_agent, whatsapp_reservations_agent, product_extraction_agent,
+    product_web_lookup_agent,
 )
 from agents.support import support_agent
-from agents.ticket_extraction.matching import UNAVAILABLE, match_product, match_supplier
+from agents.ticket_extraction.matching import MATCHED, UNAVAILABLE, match_product, match_supplier, parse_pack
 from agents.ticket_extraction.proposal import build_proposal, evaluate
 from agents.ticket_extraction.reconcile import normalize_line_items, payment_label, reconcile
 from agents.product_extraction.reconcile import reconcile as reconcile_product_label
+from agents.product_web_lookup.reconcile import reconcile_web_lookup
 from config.settings import PORT
 from intake_api import router as intake_router
 from site_commercial.routes import router as site_router
@@ -150,6 +152,7 @@ _cash_register_runner = MeteredRunner(agent=cash_register_agent, app_name="loan_
 _expense_runner = MeteredRunner(agent=expense_agent, app_name="loan_agents_expense", session_service=_session_service)
 _ticket_extraction_runner = MeteredRunner(agent=ticket_extraction_agent, app_name="loan_agents_ticket", session_service=_session_service)
 _product_extraction_runner = MeteredRunner(agent=product_extraction_agent, app_name="loan_agents_product", session_service=_session_service)
+_product_web_lookup_runner = MeteredRunner(agent=product_web_lookup_agent, app_name="loan_agents_product_web", session_service=_session_service)
 _client_followup_runner = MeteredRunner(agent=client_followup_agent, app_name="loan_agents_client_followup", session_service=_session_service)
 _order_triage_runner = MeteredRunner(agent=order_triage_agent, app_name="loan_agents_order_triage", session_service=_session_service)
 _pos_clients_support_runner = MeteredRunner(agent=pos_clients_support_agent, app_name="loan_agents_pos_clients_support", session_service=_session_service)
@@ -954,6 +957,11 @@ class ProposalLine(BaseModel):
     name: str = ""
     candidates: list[ProposalCandidate] = []
     needsReview: bool = False
+    # Presentation read off the ticket text ("45/500ML" → 45, 500, "ml"); quantity and
+    # unitCost above stay per pack. 1 / 0.0 / "" when the text does not say.
+    unitsPerPack: int = 1
+    netContent: float = 0.0
+    unitOfMeasure: str = ""
 
 
 class TicketProposal(BaseModel):
@@ -1264,6 +1272,100 @@ async def extract_product_label(req: ExtractProductLabelRequest) -> ExtractProdu
                 checked["needsReview"] = True
 
     return ExtractProductLabelResponse(**checked, existingProduct=existing, matchedBy=matched_by)
+
+
+# ── Product web lookup — POST /products/web-lookup ──────────────────────────
+class ProductWebLookupRequest(BaseModel):
+    # One ticket line: the store, its item code and the description as printed.
+    merchantName: str = ""
+    code: str = ""
+    ticketName: str = ""
+    # When given, the result is matched against this company's products so the
+    # app can offer the existing one instead of creating a duplicate.
+    companyId: int | None = None
+
+
+class WebSource(BaseModel):
+    title: str = ""
+    url: str = ""
+
+
+class ProductWebLookupResponse(BaseModel):
+    found: bool = False
+    # True only when the model confirmed the code AND the search returned sources.
+    verified: bool = False
+    codeConfirmed: bool = False
+    fullName: str = ""
+    suggestedName: str = ""      # brand + product + variant + size of ONE piece
+    brand: str = ""
+    productName: str = ""
+    variant: str = ""
+    description: str = ""
+    netContent: float = 0.0      # per piece
+    unitOfMeasure: str = ""      # g | kg | ml | L | pz | ""
+    unitsPerPack: int = 1
+    price: float = 0.0           # price the source shows, reference only
+    sources: list[WebSource] = []
+    existingProduct: RecordMatch = RecordMatch()
+    issues: list[str] = []
+    needsReview: bool = True
+
+
+async def _web_lookup_raw(req: ProductWebLookupRequest) -> tuple[dict, list[dict]]:
+    """Runs the web lookup agent; (parsed JSON or {}, search sources). The reply
+    is read from THIS turn's events (never a stale session value) and the sources
+    from the events' grounding metadata, not from what the model says."""
+    user_id = f"product-web-{uuid.uuid4()}"
+    session = await _session_service.create_session(
+        app_name="loan_agents_product_web", user_id=user_id, session_id=str(uuid.uuid4()))
+    query = json.dumps({"store": req.merchantName, "itemCode": req.code, "ticketDescription": req.ticketName},
+                       ensure_ascii=False)
+    text, sources, seen = "", [], set()
+    async for event in _product_web_lookup_runner.run_async(
+            user_id=user_id, session_id=session.id, new_message=Content(role="user", parts=[Part(text=query)])):
+        grounding = getattr(event, "grounding_metadata", None)
+        for chunk in (getattr(grounding, "grounding_chunks", None) or []):
+            web = getattr(chunk, "web", None)
+            if web and web.uri and web.uri not in seen:
+                seen.add(web.uri)
+                sources.append({"title": web.title or "", "url": web.uri})
+        if event.is_final_response() and event.content and event.content.parts:
+            text = "".join(p.text or "" for p in event.content.parts if not getattr(p, "thought", False))
+    try:
+        parsed = json.loads(_strip_json_fences(text)) if text else {}
+    except json.JSONDecodeError:
+        logger.warning("web-lookup: reply was not JSON: %s", text[:300])
+        parsed = {}
+    return (parsed if isinstance(parsed, dict) else {}), sources
+
+
+@app.post("/products/web-lookup", response_model=ProductWebLookupResponse)
+async def product_web_lookup(req: ProductWebLookupRequest) -> ProductWebLookupResponse:
+    """Searches the web for the product behind one ticket line (store item code +
+    abbreviated description) and returns its full name, brand, content per piece
+    and pieces per pack to pre-fill a new product. Advisory only — never creates
+    the product; anything unconfirmed comes back in `issues` with needsReview."""
+    code, ticket_name = req.code.strip(), req.ticketName.strip()
+    if not code and not ticket_name:
+        raise HTTPException(status_code=400, detail="code or ticketName is required")
+
+    raw, sources = await _web_lookup_raw(req)
+    checked = reconcile_web_lookup(raw, sources, parse_pack(ticket_name))
+
+    existing = RecordMatch()
+    if req.companyId is not None and checked["found"]:
+        try:
+            products = await asyncio.to_thread(list_products, req.companyId)
+        except Exception as exc:  # a lookup hiccup never fails a good search
+            logger.warning("web-lookup: product lookup failed: %s", exc)
+        else:
+            match = RecordMatch(**match_product(checked["suggestedName"] or checked["fullName"], products, code))
+            if match.status == MATCHED:
+                existing = match
+                checked["issues"].append(f"Ya existe en tu catálogo como «{match.name}» (#{match.id}).")
+                checked["needsReview"] = True
+
+    return ProductWebLookupResponse(**checked, existingProduct=existing)
 
 
 class ClientFollowUpSuggestionRequest(BaseModel):
