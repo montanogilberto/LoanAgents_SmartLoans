@@ -38,7 +38,8 @@ by `.github/workflows/` — **only on push to `main`**; `development` is not dep
   that matter.
 - Only instruct what the model can actually see and do. Check the real flow first:
   e.g. on WhatsApp the backend answers "sí"/"no" to a pending proposal itself, and
-  handoff/pause happen after the reply — the model never sees those.
+  handoff happens after the reply — the model never sees it. The agent is never
+  paused: it answers every message, even after a handoff or a staff reply (2026-11-02).
 
 ## 4. Testing
 - `python -m pytest -q tests/` before calling anything done.
@@ -54,6 +55,6 @@ by `.github/workflows/` — **only on push to `main`**; `development` is not dep
 ## 5. Cross-repo flows to keep in mind
 - WhatsApp: Meta webhook → `smartloans_backend/modules/whatsappCloud.py` →
   `whatsappReservations.reply_to` → `POST /support/whatsapp-reservations` here.
-  Typing indicator, staff pause, sí/no, booking and push copies live in the backend.
+  Typing indicator, sí/no, booking and push copies live in the backend.
 - Agent calls are logged by the backend (`integrationLogs`, service
   `loanagents_smartloans`) — that's the data for the POS "Agente WhatsApp" dashboard.
