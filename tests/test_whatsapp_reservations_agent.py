@@ -255,3 +255,68 @@ def test_prompt_delivery_app_pickup_sends_address():
     from agents.whatsapp_reservations.prompt import INSTRUCTION
     assert "DiDi, Uber" in INSTRUCTION
     assert "El conductor debe bajarse a recoger el\n  producto en la sucursal" in INSTRUCTION
+
+
+def test_prompt_closing_flow_ends_with_best_promotion():
+    from agents.whatsapp_reservations.prompt import INSTRUCTION
+    assert "¿Te funcionó la respuesta?" in INSTRUCTION
+    assert "\"1. Sí\" and \"2. No\"" in INSTRUCTION
+    assert "¿Hay algo más en lo que te pueda ayudar?" in INSTRUCTION
+    assert "mention the ONE that fits" in INSTRUCTION
+    # a bare "sí" re-proposes only after a "¿Confirmas?", not after "¿Te funcionó?"
+    assert 'If your previous message asked "¿Confirmas?"' in INSTRUCTION
+
+
+def test_business_info_marks_missing_fields(monkeypatch):
+    import tools.backend_api as api
+    monkeypatch.setattr(api, "_post", lambda *_: {"result": [{"businessInfo": [{"address": None, "phone": "662"}]}]})
+    info = api.get_business_info(1)
+    assert info["address"].startswith("NO REGISTRADO") and info["phone"] == "662"
+
+
+def test_prompt_shares_website_from_business_data_only():
+    from agents.whatsapp_reservations.prompt import INSTRUCTION
+    assert "If websiteUrl is set, share it as a\n  plain URL" in INSTRUCTION
+    assert "http" not in INSTRUCTION  # the URL is business data, never in the prompt
+
+
+ASK_FEEDBACK = "Abrimos a las 10.\n\n¿Te funcionó la respuesta?\n1. Sí\n2. No"
+ASK_MORE = "¿Hay algo más en lo que te pueda ayudar?\n1. Sí\n2. No"
+
+
+def test_conversation_stage_tracks_the_closing_flow():
+    from main import _conversation_stage
+    assert _conversation_stage("", "a qué hora abren", ASK_FEEDBACK, None) == ("feedback_asked", None)
+    assert _conversation_stage(ASK_FEEDBACK, "1", ASK_MORE, None) == ("more_asked", "yes")
+    assert _conversation_stage(ASK_FEEDBACK, "gracias 👍", ASK_MORE, None) == ("more_asked", "yes")
+    assert _conversation_stage(ASK_MORE, "no gracias", "¡Que tengas buen día! Tenemos 2X1.", None) == ("closed", None)
+    assert _conversation_stage(ASK_MORE, "2", "Hasta pronto.", None) == ("closed", None)
+
+
+def test_conversation_stage_flags_unhappy_handoff_and_open_chats():
+    from main import _conversation_stage
+    assert _conversation_stage(ASK_FEEDBACK, "2", "¿Qué faltó?", None) == ("open", "no")
+    assert _conversation_stage("", "quiero hablar con alguien", "Te contactan pronto.", "REQUEST_HUMAN") == ("handoff", None)
+    assert _conversation_stage("", "x", "Lavado mañana 10:00. ¿Confirmas?", "CREATE_RESERVATION") == ("awaiting_confirmation", None)
+    # a reply that leaves the customer without a question or goodbye isn't closed
+    assert _conversation_stage("", "hola", "Hola, ¿en qué te ayudo?", None) == ("open", None)
+    assert _conversation_stage("Abrimos a las 10.", "ok", "Perfecto.", None) == ("open", None)
+
+
+def test_reservations_route_reports_stage(monkeypatch):
+    import main
+    from fastapi.testclient import TestClient
+
+    async def run_async(*, user_id, session_id, new_message):
+        from types import SimpleNamespace
+        from google.genai.types import Content, Part
+        yield SimpleNamespace(partial=False, actions=None, is_final_response=lambda: True,
+                              content=Content(role="model", parts=[Part(text=ASK_FEEDBACK)]))
+    monkeypatch.setattr(main._whatsapp_reservations_runner, "run_async", run_async)
+
+    async def no_topic(*_):
+        return None
+    monkeypatch.setattr(main, "_classify_whatsapp_topic", no_topic)
+    data = TestClient(main.app).post("/support/whatsapp-reservations", json={
+        "companyId": 1, "phone": "5266200099999", "message": "a qué hora abren"}).json()
+    assert data["conversationStage"] == "feedback_asked" and data["feedback"] is None

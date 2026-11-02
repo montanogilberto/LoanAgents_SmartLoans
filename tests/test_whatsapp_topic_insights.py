@@ -6,7 +6,7 @@ from google.genai.types import Content, Part
 
 
 def _final(text):
-    return SimpleNamespace(is_final_response=lambda: True,
+    return SimpleNamespace(is_final_response=lambda: True, partial=False,
                            content=Content(role="model", parts=[Part(text=text)]),
                            actions=None)
 

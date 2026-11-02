@@ -14,6 +14,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -1651,6 +1652,50 @@ class WhatsAppReservationsResponse(BaseModel):
     # classifier failed or timed out. The backend stores it on the inbound
     # message for the POS "Lo que más preguntan" counts.
     topic: str | None = None
+    # Where the chat stands after this reply, for the POS "Agente WhatsApp"
+    # dashboard (the backend logs this whole response): a chat whose last
+    # stage isn't "closed" or "handoff" didn't finalize. Computed here from
+    # the reply text and the action — never chosen by the model.
+    conversationStage: str = "open"
+    # The customer's answer to "¿Te funcionó la respuesta?" ("yes"/"no"),
+    # only on the turn that answers it.
+    feedback: str | None = None
+
+
+_FEEDBACK_QUESTION = "te funcionó la respuesta"
+_MORE_QUESTION = "hay algo más en lo que te pueda ayudar"
+_YES_WORDS = {"1", "si", "sí", "sip", "simon", "ok", "va", "claro", "perfecto", "listo", "gracias", "👍"}
+_NO_WORDS = {"2", "no", "nop", "nel"}
+
+
+def _answer_kind(message: str) -> str | None:
+    """"yes"/"no" for a short reply to a 1/2 question, else None."""
+    words = re.sub(r"[^\w\s👍]", " ", (message or "").lower()).split()
+    if not words or len(words) > 4:
+        return None
+    if words[0] in _NO_WORDS:
+        return "no"
+    if words[0] in _YES_WORDS or "👍" in message:
+        return "yes"
+    return None
+
+
+def _conversation_stage(prev_reply: str, message: str, reply: str,
+                        capability: str | None) -> tuple[str, str | None]:
+    prev, low = (prev_reply or "").lower(), (reply or "").lower()
+    feedback = _answer_kind(message) if _FEEDBACK_QUESTION in prev else None
+    if capability == "REQUEST_HUMAN":
+        return "handoff", feedback
+    if capability == "CREATE_RESERVATION":
+        return "awaiting_confirmation", feedback
+    if _FEEDBACK_QUESTION in low:
+        return "feedback_asked", feedback
+    if _MORE_QUESTION in low:
+        return "more_asked", feedback
+    # A goodbye: the customer declined more help and the reply asks nothing.
+    if "?" not in low and "?" in prev and (_MORE_QUESTION in prev or _answer_kind(message) == "no"):
+        return "closed", feedback
+    return "open", feedback
 
 
 _WEEKDAYS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
@@ -1736,8 +1781,8 @@ async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> Wha
     )
     # Tagged in parallel with the reply, so it adds no latency. The previous
     # reply (still in state before this turn) lets "3" or "sí" be read in context.
-    topic_task = asyncio.create_task(
-        _classify_whatsapp_topic(req.message, session.state.get("whatsapp_reservations_reply")))
+    prev_reply = session.state.get("whatsapp_reservations_reply") or ""
+    topic_task = asyncio.create_task(_classify_whatsapp_topic(req.message, prev_reply))
     # Hermosillo is UTC-7 all year — same convention as tools/backend_api.py.
     now_local = datetime.now(timezone.utc) - timedelta(hours=7)
     context = {
@@ -1761,27 +1806,37 @@ async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> Wha
     # a bare "3" after the menu), output_key keeps the PREVIOUS turn's text and
     # the customer got the old message again — every answer one turn late.
     # One retry with an internal nudge recovers the empty turn.
+    # Text the model writes in the same step as a tool call (e.g. a goodbye
+    # before get_promotions) is not a "final response" event, so the reply is
+    # every model text of this turn, joined — not just the last one.
     pending_raw = None
     reply = ""
     for attempt in range(2):
+        texts = []
         async for event in _whatsapp_reservations_runner.run_async(user_id=user_id, session_id=session.id, new_message=message):
             delta = event.actions.state_delta if event.actions else {}
             if "pending_action" in delta:
                 pending_raw = delta["pending_action"]
-            if event.is_final_response() and event.content and event.content.parts:
+            if not event.partial and event.content and event.content.role == "model" and event.content.parts:
                 text = "".join(p.text or "" for p in event.content.parts if not getattr(p, "thought", False)).strip()
                 if text:
-                    reply = text
+                    texts.append(text)
+        reply = "\n\n".join(texts)
         if reply:
             break
         message = Content(role="user", parts=[Part(text=(
             "(Mensaje interno del sistema, no del cliente: tu respuesta anterior quedó vacía. "
             "Responde ahora al último mensaje del cliente siguiendo tus instrucciones.)"))])
 
-    if not reply:
-        reply = "Perdón, se me complicó responderte. ¿Me lo puedes escribir de otra forma?"
     pending_action = PendingAction(**pending_raw) if isinstance(pending_raw, dict) else None
-    return WhatsAppReservationsResponse(reply=reply, pendingAction=pending_action, topic=await topic_task)
+    if reply:
+        stage, feedback = _conversation_stage(prev_reply, req.message, reply,
+                                              pending_action.capability if pending_action else None)
+    else:
+        reply = "Perdón, se me complicó responderte. ¿Me lo puedes escribir de otra forma?"
+        stage, feedback = "error", None
+    return WhatsAppReservationsResponse(reply=reply, pendingAction=pending_action, topic=await topic_task,
+                                        conversationStage=stage, feedback=feedback)
 
 
 class WhatsAppInsightsTopicCount(BaseModel):
