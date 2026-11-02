@@ -320,3 +320,24 @@ def test_reservations_route_reports_stage(monkeypatch):
     data = TestClient(main.app).post("/support/whatsapp-reservations", json={
         "companyId": 1, "phone": "5266200099999", "message": "a qué hora abren"}).json()
     assert data["conversationStage"] == "feedback_asked" and data["feedback"] is None
+
+
+def test_closing_options_only_under_closing_questions():
+    from main import _fix_closing_options
+    assert _fix_closing_options(ASK_FEEDBACK) == ASK_FEEDBACK
+    assert _fix_closing_options(ASK_MORE) == ASK_MORE
+    # added when missing
+    assert _fix_closing_options("Abrimos a las 10.\n\n¿Te funcionó la respuesta?") == ASK_FEEDBACK
+    # dropped under any other question
+    offer = "No tengo ese dato. ¿Te comunico con alguien del equipo?\n1. Sí\n2. No"
+    assert _fix_closing_options(offer) == "No tengo ese dato. ¿Te comunico con alguien del equipo?"
+    both = ("¿Te paso con alguien?\n1. Sí\n2. No\n\nTambién mira la web.\n\n"
+            "¿Te funcionó la respuesta?\n1. Sí\n2. No")
+    assert _fix_closing_options(both) == (
+        "¿Te paso con alguien?\n\nTambién mira la web.\n\n¿Te funcionó la respuesta?\n1. Sí\n2. No")
+
+
+def test_closing_questions_put_back_word_for_word():
+    from main import _fix_closing_options
+    assert _fix_closing_options("¿Hay algo más en lo que te pueda ayudar, Gilberto?") == ASK_MORE
+    assert _fix_closing_options("Listo.\n¿Hay algo más en lo que te pueda ayudar mientras esperas?") == "Listo.\n" + ASK_MORE
