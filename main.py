@@ -1761,17 +1761,22 @@ async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> Wha
     # a bare "3" after the menu), output_key keeps the PREVIOUS turn's text and
     # the customer got the old message again — every answer one turn late.
     # One retry with an internal nudge recovers the empty turn.
+    # Text the model writes in the same step as a tool call (e.g. a goodbye
+    # before get_promotions) is not a "final response" event, so the reply is
+    # every model text of this turn, joined — not just the last one.
     pending_raw = None
     reply = ""
     for attempt in range(2):
+        texts = []
         async for event in _whatsapp_reservations_runner.run_async(user_id=user_id, session_id=session.id, new_message=message):
             delta = event.actions.state_delta if event.actions else {}
             if "pending_action" in delta:
                 pending_raw = delta["pending_action"]
-            if event.is_final_response() and event.content and event.content.parts:
+            if not event.partial and event.content and event.content.role == "model" and event.content.parts:
                 text = "".join(p.text or "" for p in event.content.parts if not getattr(p, "thought", False)).strip()
                 if text:
-                    reply = text
+                    texts.append(text)
+        reply = "\n\n".join(texts)
         if reply:
             break
         message = Content(role="user", parts=[Part(text=(

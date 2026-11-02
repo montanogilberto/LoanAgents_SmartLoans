@@ -691,8 +691,9 @@ def get_promotions(company_id: int) -> list[dict]:
 
 
 def get_business_info(company_id: int, branch_id: int | None = None) -> dict:
-    """The business's own info: address, maps link, phone, email, payment
-    methods, services/prices text and extra notes. Branch values override
+    """The business's own info: address (+ street/city/postalCode), maps
+    link, phone, WhatsApp number, email, website, payment methods,
+    services/prices text, pickup/delivery policies and extra notes. Branch values override
     the company-wide ones. Any field may be null = not provided.
 
     Args:
@@ -702,7 +703,23 @@ def get_business_info(company_id: int, branch_id: int | None = None) -> dict:
     result = _post("/businessInfo", {"businessInfo": [{"companyId": company_id, "branchId": branch_id}]})
     rows = result.get("result", []) if isinstance(result, dict) else []
     info = (rows[0].get("businessInfo") or []) if rows else []
-    return info[0] if info else {}
+    return _mark_not_provided(info[0] if info else {})
+
+
+# A bare null was read as "fill this in": asked whether a DiDi/Uber can pick up
+# an order (the prompt says to give the address), Gemini invented addresses for
+# a business with none loaded. An explicit value is followed far more reliably.
+_NOT_PROVIDED = "NO REGISTRADO — el negocio no lo ha cargado; no lo inventes ni lo menciones como dato"
+_INFO_FIELDS = ("address", "street", "city", "postalCode", "mapsUrl", "phone", "whatsappNumber", "email",
+                "websiteUrl", "paymentMethods", "servicesInfo", "pickupPolicy", "deliveryPolicy", "extraInfo")
+
+
+def _mark_not_provided(info: dict) -> dict:
+    out = dict(info)
+    for key in _INFO_FIELDS:
+        if not out.get(key):
+            out[key] = _NOT_PROVIDED
+    return out
 
 
 def get_faqs(company_id: int, branch_id: int | None = None) -> list[dict]:

@@ -255,3 +255,26 @@ def test_prompt_delivery_app_pickup_sends_address():
     from agents.whatsapp_reservations.prompt import INSTRUCTION
     assert "DiDi, Uber" in INSTRUCTION
     assert "El conductor debe bajarse a recoger el\n  producto en la sucursal" in INSTRUCTION
+
+
+def test_prompt_closing_flow_ends_with_best_promotion():
+    from agents.whatsapp_reservations.prompt import INSTRUCTION
+    assert "¿Te funcionó la respuesta?" in INSTRUCTION
+    assert "\"1. Sí\" and \"2. No\"" in INSTRUCTION
+    assert "¿Hay algo más en lo que te pueda ayudar?" in INSTRUCTION
+    assert "mention the ONE that fits" in INSTRUCTION
+    # a bare "sí" re-proposes only after a "¿Confirmas?", not after "¿Te funcionó?"
+    assert 'If your previous message asked "¿Confirmas?"' in INSTRUCTION
+
+
+def test_business_info_marks_missing_fields(monkeypatch):
+    import tools.backend_api as api
+    monkeypatch.setattr(api, "_post", lambda *_: {"result": [{"businessInfo": [{"address": None, "phone": "662"}]}]})
+    info = api.get_business_info(1)
+    assert info["address"].startswith("NO REGISTRADO") and info["phone"] == "662"
+
+
+def test_prompt_shares_website_from_business_data_only():
+    from agents.whatsapp_reservations.prompt import INSTRUCTION
+    assert "If websiteUrl is set, share it as a\n  plain URL" in INSTRUCTION
+    assert "http" not in INSTRUCTION  # the URL is business data, never in the prompt
