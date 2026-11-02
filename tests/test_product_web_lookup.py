@@ -47,7 +47,7 @@ def test_proposal_lines_carry_the_breakdown_and_stay_per_pack():
 
 # ---- reconcile_web_lookup --------------------------------------------------
 WATER = {"found": True, "fullName": "Agua Purificada Member's Mark 45 pzas de 500 ml", "brand": "Member's Mark",
-         "productName": "Agua Purificada", "variant": "", "description": "Agua purificada.",
+         "productName": "Agua Purificada", "variant": "", "productType": "agua", "description": "Agua purificada.",
          "netContent": 500, "unitOfMeasure": "ml", "unitsPerPack": 45, "price": 122.76,
          "codeConfirmed": True, "notes": []}
 SOURCES = [{"title": "sams.com.mx", "url": "https://example.invalid/r"}]
@@ -58,6 +58,11 @@ def test_confirmed_code_with_sources_is_verified():
     r = reconcile_web_lookup(WATER, SOURCES, TICKET)
     assert r["verified"] and not r["needsReview"] and r["issues"] == []
     assert r["suggestedName"] == "Member's Mark Agua Purificada 500 ml"
+
+
+def test_product_type_gets_one_spelling():
+    assert reconcile_web_lookup(WATER, SOURCES, TICKET)["productType"] == "Agua"
+    assert reconcile_web_lookup({**WATER, "productType": "  DETERGENTE   en polvo "}, SOURCES)["productType"] == "Detergente en polvo"
 
 
 def test_a_confirmation_without_sources_is_not_trusted():
@@ -104,6 +109,8 @@ def test_suggested_name_does_not_repeat_the_size():
     assert suggested_name({"brand": "Axion", "productName": "Lavatrastes 2.8 L", "variant": "",
                            "fullName": "", "netContent": 2.8, "unitOfMeasure": "L"}) == "Axion Lavatrastes 2.8 L"
     assert normalize_unit("Lts.") == "L"
+    assert suggested_name({"brand": "Coca-Cola", "productName": "Refresco Original", "variant": "Original",
+                           "fullName": "", "netContent": 600, "unitOfMeasure": "ml"}) == "Coca-Cola Refresco Original 600 ml"
 
 
 # ---- endpoint wiring -------------------------------------------------------
@@ -130,6 +137,7 @@ def test_endpoint_returns_the_checked_result(monkeypatch):
     body = c.post("/products/web-lookup", json={"merchantName": "Sam's Club", "code": "981017658",
                                                  "ticketName": "45/500ML AGU"}).json()
     assert body["verified"] and body["unitsPerPack"] == 45 and body["sources"][0]["title"] == "sams.com.mx"
+    assert body["currency"] == "MXN"  # Mexico is the default country/currency
 
 
 def test_endpoint_flags_an_existing_catalog_product(monkeypatch):

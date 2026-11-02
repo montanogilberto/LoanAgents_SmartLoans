@@ -25,7 +25,8 @@ def test_whatsapp_reservations_agent_has_expected_tools():
     tool_names = {t.func.__name__ for t in whatsapp_reservations_agent.tools if hasattr(t, "func")}
     assert tool_names == {"get_reservation_services", "get_reservation_hours",
                           "get_available_slots", "get_promotions", "get_business_info",
-                          "get_faqs", "get_my_reward_points", "propose_action"}
+                          "get_faqs", "get_my_reward_points", "get_machine_availability",
+                          "propose_action"}
 
 
 def test_route_registered():
@@ -72,7 +73,11 @@ def _call_route(monkeypatch, **overrides):
         return
         yield  # async generator with no events
 
+    async def fake_topic(message, previous_reply):
+        return None
+
     monkeypatch.setattr(main._whatsapp_reservations_runner, "run_async", fake_run_async)
+    monkeypatch.setattr(main, "_classify_whatsapp_topic", fake_topic)
     req = main.WhatsAppReservationsRequest(
         **{"companyId": 1, "phone": "+526621234567", "message": "hola", **overrides})
     resp = asyncio.run(main.support_whatsapp_reservations(req))
@@ -183,3 +188,70 @@ def test_empty_model_turn_never_returns_the_previous_reply(monkeypatch):
     _, seen2, resp = _call_route(monkeypatch, branchId=5, phone="+520000000055")
     assert resp.reply != "MENU DEL TURNO ANTERIOR"
     assert seen2["calls"] == 2  # retried once before falling back
+
+
+# ── get_machine_availability (pure part) ───────────────────────────────────
+from datetime import datetime, timezone  # noqa: E402
+
+_NOW = datetime(2026, 11, 2, 3, 0, tzinfo=timezone.utc)
+
+
+def _dev(device_id, name, **kw):
+    return {"deviceId": device_id, "name": name, "machineType": "washer", "isActive": 1,
+            "isOnline": 1, "lastStatus": "idle", "cycleMinutes": 45, **kw}
+
+
+def _use(device_id, created, status="authorized"):
+    return {"deviceId": device_id, "status": status, "created_At": created}
+
+
+def test_machine_availability_states_and_order():
+    from tools.backend_api import _machine_availability
+    devices = [
+        _dev(1, "Lavadora 1"),                                    # cycle started 30 min ago -> ~15 left
+        _dev(2, "Lavadora 2"),                                    # free
+        _dev(3, "Secadora 1", machineType="dryer", isOnline=0),   # offline
+        _dev(4, "Lavadora 3", lastStatus="error"),                # fault
+        _dev(5, "Lavadora 4", isActive=0),                        # disabled -> hidden
+        _dev(6, "Lavadora 5", lastStatus="running"),              # running, no known charge
+    ]
+    uses = [_use(1, "2026-11-02T02:30:00"), _use(2, "2026-11-02T01:00:00"),
+            _use(2, "2026-11-02T02:50:00", status="rejected")]
+    r = _machine_availability(devices, uses, None, _NOW)
+    assert (r["available"], r["inUse"], r["outOfService"]) == (1, 2, 2)
+    by_name = {m["name"]: m for m in r["machines"]}
+    assert "Lavadora 4" not in by_name
+    assert by_name["Lavadora 1"] == {"name": "Lavadora 1", "type": "Lavadora", "state": "en_uso", "minutesLeft": 15}
+    assert by_name["Lavadora 2"]["state"] == "disponible"           # rejected charge doesn't start a cycle
+    assert by_name["Lavadora 5"] == {"name": "Lavadora 5", "type": "Lavadora", "state": "en_uso", "minutesLeft": None}
+    assert by_name["Secadora 1"]["state"] == by_name["Lavadora 3"]["state"] == "fuera_de_servicio"
+    assert [m["name"] for m in r["machines"]][:3] == ["Lavadora 2", "Lavadora 1", "Lavadora 5"]
+
+
+def test_machine_availability_never_leaks_business_data():
+    from tools.backend_api import _machine_availability
+    r = _machine_availability([_dev(1, "Lavadora 1", lastIp="10.0.0.5", lastRssi=-60, priceMXN=40)],
+                              [{**_use(1, "2026-11-02T02:30:00"), "clientId": 77, "amountMXN": 40}], None, _NOW)
+    assert set(r["machines"][0]) == {"name", "type", "state", "minutesLeft"}
+    assert "77" not in str(r) and "10.0.0.5" not in str(r)
+
+
+def test_machine_availability_branch_filter_and_none():
+    from tools.backend_api import _machine_availability
+    devices = [_dev(1, "Centro", branchId=1), _dev(2, "Norte", branchId=2), _dev(3, "Sin sucursal")]
+    names = {m["name"] for m in _machine_availability(devices, [], 2, _NOW)["machines"]}
+    assert names == {"Norte", "Sin sucursal"}
+    assert _machine_availability([], [], None, _NOW) == {"status": "no_machines"}
+    assert _machine_availability([_dev(1, "X", isActive=0)], [], None, _NOW) == {"status": "no_machines"}
+
+
+def test_prompt_shares_address_and_maps_link():
+    from agents.whatsapp_reservations.prompt import INSTRUCTION
+    assert "mapsUrl as-is on its own line" in INSTRUCTION
+    assert "no links." not in INSTRUCTION
+
+
+def test_prompt_delivery_app_pickup_sends_address():
+    from agents.whatsapp_reservations.prompt import INSTRUCTION
+    assert "DiDi, Uber" in INSTRUCTION
+    assert "El conductor debe bajarse a recoger el\n  producto en la sucursal" in INSTRUCTION

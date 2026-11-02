@@ -761,3 +761,84 @@ def get_my_reward_points(tool_context: ToolContext) -> dict:
     if row.get("status") != "found":
         return {"status": row.get("status") or "unavailable"}
     return {k: row.get(k) for k in ("status", "firstName", "balance", "lifetimeEarned", "redeemable")}
+
+
+
+# ── ESP32 laundry machines: availability for WhatsApp customers ─────────────
+# State rules match POSVending src/pages/iot/IotDashboard/IotDashboardLogic.ts
+# (the POS "Tablero IOT"). Customers only get availability — never income,
+# the error log or other clients' uses: anyone can write to the business number.
+_MACHINE_TYPE_ES = {"washer": "Lavadora", "dryer": "Secadora", "combo": "Lavadora-secadora"}
+
+
+def _utc(iso: str) -> datetime:
+    s = iso if ("+" in iso[10:] or iso.endswith("Z")) else iso + "Z"
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def get_machine_availability(tool_context: ToolContext) -> dict:
+    """Which of the business's self-service laundry machines are free right
+    now, which are in use and roughly when they free up. Takes no company
+    argument on purpose: it is the business this WhatsApp number belongs to
+    (set by the system in session state).
+
+    Returns:
+        {"status": "ok", "available": int, "inUse": int, "outOfService": int,
+         "machines": [{"name", "type": Lavadora|Secadora|Lavadora-secadora,
+                       "state": disponible|en_uso|fuera_de_servicio,
+                       "minutesLeft": int | None}]}   (minutesLeft only for en_uso
+                       when known; free machines first, then by minutesLeft)
+        {"status": "no_machines"} — the business has no connected machines.
+        {"status": "unavailable"} — the lookup failed.
+    """
+    company_id = tool_context.state.get("wa_company_id")
+    branch_id = tool_context.state.get("wa_branch_id")
+    if not company_id:
+        return {"status": "unavailable"}
+    try:
+        devices = _post("/all_laundryDevices", {"laundryDevices": [{"companyId": company_id}]}).get("laundryDevices") or []
+        uses = _post("/all_laundryDeviceUses", {"laundryDeviceUses": [
+            {"companyId": company_id, "top": 100}]}).get("laundryDeviceUses") or []
+    except Exception:
+        return {"status": "unavailable"}
+    return _machine_availability(devices, uses, branch_id, datetime.now(timezone.utc))
+
+
+def _machine_availability(devices: list[dict], uses: list[dict], branch_id, now: datetime) -> dict:
+    """Pure part of get_machine_availability (uses newest first, as the SP returns them).
+    A machine with a branch is shown only on that branch's number."""
+    devices = [d for d in devices if d.get("isActive")
+               and (not branch_id or not d.get("branchId") or d.get("branchId") == branch_id)]
+    if not devices:
+        return {"status": "no_machines"}
+
+    machines = []
+    for d in devices:
+        last_ok = next((u for u in uses if u.get("deviceId") == d.get("deviceId")
+                        and u.get("status") == "authorized"), None)
+        minutes_left = None
+        if last_ok:
+            start = _utc(last_ok.get("settled_At") or last_ok["created_At"])
+            left = (start + timedelta(minutes=int(d.get("cycleMinutes") or 0)) - now).total_seconds() / 60
+            if left > 0:
+                minutes_left = int(left) + (1 if left % 1 else 0)
+        status = (d.get("lastStatus") or "").lower()
+        if not d.get("isOnline") or status == "error":
+            state = "fuera_de_servicio"
+        elif minutes_left is not None or status == "running":
+            state = "en_uso"
+        else:
+            state = "disponible"
+        machines.append({"name": d.get("name"),
+                         "type": _MACHINE_TYPE_ES.get(d.get("machineType"), d.get("machineType")),
+                         "state": state, "minutesLeft": minutes_left if state == "en_uso" else None})
+
+    order = {"disponible": 0, "en_uso": 1, "fuera_de_servicio": 2}
+    machines.sort(key=lambda m: (order[m["state"]], m["minutesLeft"] if m["minutesLeft"] is not None else 10**6))
+    return {
+        "status": "ok",
+        "available": sum(m["state"] == "disponible" for m in machines),
+        "inUse": sum(m["state"] == "en_uso" for m in machines),
+        "outOfService": sum(m["state"] == "fuera_de_servicio" for m in machines),
+        "machines": machines,
+    }
