@@ -22,6 +22,8 @@ from agents.pos_expenses_support import pos_expenses_support_agent
 from agents.pos_accounting_support import pos_accounting_support_agent
 from agents.pos_rewards_support import pos_rewards_support_agent
 from agents.whatsapp_reservations import whatsapp_reservations_agent
+from agents.whatsapp_topic import whatsapp_topic_agent
+from agents.whatsapp_insights import whatsapp_insights_agent
 
 root_agent = orchestrator_agent
 
@@ -50,5 +52,7 @@ __all__ = [
     "pos_accounting_support_agent",
     "pos_rewards_support_agent",
     "whatsapp_reservations_agent",
+    "whatsapp_topic_agent",
+    "whatsapp_insights_agent",
     "root_agent",
 ]

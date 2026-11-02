@@ -33,9 +33,10 @@ from agents import (
     ticket_extraction_agent, client_followup_agent, order_triage_agent, pos_clients_support_agent,
     pos_income_support_agent, pos_expenses_support_agent, pos_accounting_support_agent,
     pos_rewards_support_agent, whatsapp_reservations_agent, product_extraction_agent,
-    product_web_lookup_agent,
+    product_web_lookup_agent, whatsapp_topic_agent, whatsapp_insights_agent,
 )
 from agents.support import support_agent
+from agents.whatsapp_topic.prompt import TOPICS as WHATSAPP_TOPICS
 from agents.ticket_extraction.matching import MATCHED, UNAVAILABLE, match_product, match_supplier, parse_pack
 from agents.ticket_extraction.proposal import build_proposal, evaluate
 from agents.ticket_extraction.reconcile import normalize_line_items, payment_label, reconcile
@@ -161,6 +162,8 @@ _pos_expenses_support_runner = MeteredRunner(agent=pos_expenses_support_agent, a
 _pos_accounting_support_runner = MeteredRunner(agent=pos_accounting_support_agent, app_name="loan_agents_pos_accounting_support", session_service=_session_service)
 _pos_rewards_support_runner = MeteredRunner(agent=pos_rewards_support_agent, app_name="loan_agents_pos_rewards_support", session_service=_session_service)
 _whatsapp_reservations_runner = MeteredRunner(agent=whatsapp_reservations_agent, app_name="loan_agents_whatsapp_reservations", session_service=_session_service)
+_whatsapp_topic_runner = MeteredRunner(agent=whatsapp_topic_agent, app_name="loan_agents_whatsapp_topic", session_service=_session_service)
+_whatsapp_insights_runner = MeteredRunner(agent=whatsapp_insights_agent, app_name="loan_agents_whatsapp_insights", session_service=_session_service)
 
 
 class NegotiateRequest(BaseModel):
@@ -1644,6 +1647,10 @@ class WhatsAppReservationsRequest(BaseModel):
 class WhatsAppReservationsResponse(BaseModel):
     reply: str
     pendingAction: PendingAction | None = None
+    # What the customer wants (agents/whatsapp_topic TOPICS); None when the
+    # classifier failed or timed out. The backend stores it on the inbound
+    # message for the POS "Lo que más preguntan" counts.
+    topic: str | None = None
 
 
 _WEEKDAYS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
@@ -1653,6 +1660,48 @@ _WEEKDAYS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado",
 # no stale "mañana" from last week) — a booking already made still reaches
 # the agent through recentReservation.
 _WHATSAPP_SESSION_IDLE_SECONDS = 6 * 60 * 60
+
+# The topic tag must never delay or break the customer's reply.
+_WHATSAPP_TOPIC_TIMEOUT_SECONDS = 10
+
+
+async def _run_one_shot_json(runner, app_name: str, output_key: str, payload: dict) -> dict:
+    """Runs a no-tools agent once on a throwaway session and parses its JSON
+    output. The session is deleted afterwards — these run per WhatsApp
+    message, and InMemorySessionService would otherwise keep every one."""
+    # One fixed user id: InMemorySessionService keeps an (empty) dict per user
+    # id even after its last session is deleted.
+    user_id = app_name
+    session = await _session_service.create_session(
+        app_name=app_name, user_id=user_id, session_id=str(uuid.uuid4()), state={output_key: ""})
+    try:
+        message = Content(role="user", parts=[Part(text=json.dumps(payload, ensure_ascii=False))])
+        raw = ""
+        async for event in runner.run_async(user_id=user_id, session_id=session.id, new_message=message):
+            if event.is_final_response() and event.content and event.content.parts:
+                text = "".join(p.text or "" for p in event.content.parts if not getattr(p, "thought", False)).strip()
+                if text:
+                    raw = text
+        try:
+            result = json.loads(_strip_json_fences(raw)) if raw else {}
+        except json.JSONDecodeError:
+            result = {}
+        return result if isinstance(result, dict) else {}
+    finally:
+        await _session_service.delete_session(app_name=app_name, user_id=user_id, session_id=session.id)
+
+
+async def _classify_whatsapp_topic(message: str, previous_reply: str | None) -> str | None:
+    try:
+        result = await asyncio.wait_for(
+            _run_one_shot_json(_whatsapp_topic_runner, "loan_agents_whatsapp_topic", "whatsapp_topic_result",
+                               {"message": message, "previousReply": previous_reply or None}),
+            timeout=_WHATSAPP_TOPIC_TIMEOUT_SECONDS)
+    except Exception:
+        logger.exception("[whatsapp_topic] classification failed")
+        return None
+    topic = result.get("topic")
+    return topic if topic in WHATSAPP_TOPICS else None
 
 
 @app.post("/support/whatsapp-reservations", response_model=WhatsAppReservationsResponse)
@@ -1678,12 +1727,17 @@ async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> Wha
         user_id=user_id,
         session_id=user_id,
         # The session is keyed by company + branch + phone, so these never
-        # change for it. get_my_reward_points reads them from here — the
+        # change for it. get_my_reward_points and get_machine_availability read them from here — the
         # phone is Meta's verified sender, never something the model chose.
         initial_state={"whatsapp_reservations_reply": "",
                        "wa_company_id": req.companyId,
+                       "wa_branch_id": req.branchId,
                        "wa_customer_phone": req.phone},
     )
+    # Tagged in parallel with the reply, so it adds no latency. The previous
+    # reply (still in state before this turn) lets "3" or "sí" be read in context.
+    topic_task = asyncio.create_task(
+        _classify_whatsapp_topic(req.message, session.state.get("whatsapp_reservations_reply")))
     # Hermosillo is UTC-7 all year — same convention as tools/backend_api.py.
     now_local = datetime.now(timezone.utc) - timedelta(hours=7)
     context = {
@@ -1727,7 +1781,68 @@ async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> Wha
     if not reply:
         reply = "Perdón, se me complicó responderte. ¿Me lo puedes escribir de otra forma?"
     pending_action = PendingAction(**pending_raw) if isinstance(pending_raw, dict) else None
-    return WhatsAppReservationsResponse(reply=reply, pendingAction=pending_action)
+    return WhatsAppReservationsResponse(reply=reply, pendingAction=pending_action, topic=await topic_task)
+
+
+class WhatsAppInsightsTopicCount(BaseModel):
+    topic: str
+    count: int
+
+
+class WhatsAppInsightsRequest(BaseModel):
+    companyId: int
+    startDate: str
+    endDate: str
+    topicCounts: list[WhatsAppInsightsTopicCount] = []
+    # Customer messages of the period, newest first, phones/emails already
+    # stripped by smartloans_backend (modules/whatsappChatMessages).
+    messages: list[str]
+
+
+class WhatsAppCommonDoubt(BaseModel):
+    question: str
+    count: int = 0
+    suggestion: str = ""
+
+
+class WhatsAppInsightsResponse(BaseModel):
+    summary: str = ""
+    commonDoubts: list[WhatsAppCommonDoubt] = []
+    unmetNeeds: list[str] = []
+    messagesAnalyzed: int = 0
+
+
+# Bounds the prompt: enough to see patterns, far below the model's context.
+_WHATSAPP_INSIGHTS_MAX_MESSAGES = 500
+_WHATSAPP_INSIGHTS_MAX_CHARS = 300
+
+
+@app.post("/support/whatsapp-insights", response_model=WhatsAppInsightsResponse)
+async def support_whatsapp_insights(req: WhatsAppInsightsRequest) -> WhatsAppInsightsResponse:
+    """POS "¿Qué quieren mis clientes?": summarizes a period of WhatsApp
+    customer messages for one company — common doubts with a suggested
+    action, and needs the business doesn't cover. Advisory, read-only; the
+    backend never stores it or sends it to customers."""
+    messages = [m.strip()[:_WHATSAPP_INSIGHTS_MAX_CHARS] for m in req.messages if m and m.strip()]
+    messages = messages[:_WHATSAPP_INSIGHTS_MAX_MESSAGES]
+    if not messages:
+        return WhatsAppInsightsResponse(summary="Todavía no hay mensajes de clientes en este periodo.")
+    result = await _run_one_shot_json(
+        _whatsapp_insights_runner, "loan_agents_whatsapp_insights", "whatsapp_insights_result",
+        {"period": {"startDate": req.startDate, "endDate": req.endDate},
+         "topicCounts": [t.model_dump() for t in req.topicCounts],
+         "messages": messages})
+    doubts = [
+        WhatsAppCommonDoubt(question=str(d.get("question", "")), count=int(d.get("count") or 0),
+                            suggestion=str(d.get("suggestion", "")))
+        for d in result.get("commonDoubts", []) if isinstance(d, dict) and d.get("question")
+    ][:5]
+    return WhatsAppInsightsResponse(
+        summary=str(result.get("summary", "")),
+        commonDoubts=doubts,
+        unmetNeeds=[str(n) for n in result.get("unmetNeeds", []) if n][:10],
+        messagesAnalyzed=len(messages),
+    )
 
 
 class OrderStaleEntry(BaseModel):

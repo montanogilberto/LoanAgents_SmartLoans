@@ -4,7 +4,7 @@ from google.adk.tools import FunctionTool
 
 from agents.whatsapp_reservations.prompt import INSTRUCTION
 from tools.backend_api import (
-    get_available_slots, get_business_info, get_faqs, get_my_reward_points,
+    get_available_slots, get_business_info, get_faqs, get_machine_availability, get_my_reward_points,
     get_promotions, get_reservation_hours, get_reservation_services,
 )
 from tools.pending_actions import propose_action
@@ -14,8 +14,10 @@ whatsapp_reservations_agent = Agent(
     description=(
         "WhatsApp assistant for a business's customers — reservations (catalog "
         "services + real free slots; PROPOSES, the backend books after \"sí\"), "
-        "opening hours, the promotions the POS applies, business info and FAQs, "
-        "the sender's own reward points and client QR (SEND_CLIENT_QR), and "
+        "opening hours, the promotions the POS applies, business info (address + "
+        "maps link) and FAQs, "
+        "the sender's own reward points and client QR (SEND_CLIENT_QR), whether "
+        "the self-service laundry machines are free right now, and "
         "handing off to a person (REQUEST_HUMAN). Answers business facts only from tools."
     ),
     model="gemini-2.5-flash",
@@ -28,6 +30,7 @@ whatsapp_reservations_agent = Agent(
         FunctionTool(func=get_business_info),
         FunctionTool(func=get_faqs),
         FunctionTool(func=get_my_reward_points),
+        FunctionTool(func=get_machine_availability),
         FunctionTool(func=propose_action),
     ],
     output_key="whatsapp_reservations_reply",
