@@ -320,3 +320,52 @@ def test_reservations_route_reports_stage(monkeypatch):
     data = TestClient(main.app).post("/support/whatsapp-reservations", json={
         "companyId": 1, "phone": "5266200099999", "message": "a qué hora abren"}).json()
     assert data["conversationStage"] == "feedback_asked" and data["feedback"] is None
+
+
+def test_closing_options_only_under_closing_questions():
+    from main import _fix_closing_options
+    assert _fix_closing_options(ASK_FEEDBACK) == ASK_FEEDBACK
+    assert _fix_closing_options(ASK_MORE) == ASK_MORE
+    # added when missing
+    assert _fix_closing_options("Abrimos a las 10.\n\n¿Te funcionó la respuesta?") == ASK_FEEDBACK
+    # dropped under any other question
+    offer = "No tengo ese dato. ¿Te comunico con alguien del equipo?\n1. Sí\n2. No"
+    assert _fix_closing_options(offer) == "No tengo ese dato. ¿Te comunico con alguien del equipo?"
+    both = ("¿Te paso con alguien?\n1. Sí\n2. No\n\nTambién mira la web.\n\n"
+            "¿Te funcionó la respuesta?\n1. Sí\n2. No")
+    assert _fix_closing_options(both) == (
+        "¿Te paso con alguien?\n\nTambién mira la web.\n\n¿Te funcionó la respuesta?\n1. Sí\n2. No")
+
+
+def test_closing_questions_put_back_word_for_word():
+    from main import _fix_closing_options
+    assert _fix_closing_options("¿Hay algo más en lo que te pueda ayudar, Gilberto?") == ASK_MORE
+    assert _fix_closing_options("Listo.\n¿Hay algo más en lo que te pueda ayudar mientras esperas?") == "Listo.\n" + ASK_MORE
+
+
+def test_read_tools_never_crash_the_turn(monkeypatch):
+    """2026-11-02: get_reservation_services timed out after a backend restart and the
+    whole turn crashed (500 → "Perdón, tuve un problema"). Read tools now report it."""
+    import httpx
+    import tools.backend_api as api
+    from agents.whatsapp_reservations.agent import whatsapp_reservations_agent as agent
+
+    def boom(*_a, **_k):
+        raise httpx.ReadTimeout("The read operation timed out")
+    monkeypatch.setattr(api, "_post", boom)
+    tools = {t.func.__name__: t.func for t in agent.tools if hasattr(t, "func")}
+    assert tools["get_reservation_services"](1)["status"] == "unavailable"
+    assert tools["get_available_slots"](1, "2026-11-03", 5)["status"] == "unavailable"
+
+
+def test_wrapped_tools_keep_their_declaration():
+    """ADK builds the tool schema from name, docstring and signature: the wrapper keeps them."""
+    import inspect
+    from agents.whatsapp_reservations.agent import whatsapp_reservations_agent as agent
+    tools = {t.func.__name__: t for t in agent.tools if hasattr(t, "func")}
+    assert list(inspect.signature(tools["get_available_slots"].func).parameters) == [
+        "company_id", "date", "reservation_service_id"]
+    assert "tool_context" in inspect.signature(tools["get_my_reward_points"].func).parameters
+    assert tools["get_reservation_services"].func.__doc__
+    decl = tools["get_available_slots"]._get_declaration()
+    assert decl.name == "get_available_slots" and decl.parameters.properties

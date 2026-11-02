@@ -1668,6 +1668,23 @@ _YES_WORDS = {"1", "si", "sí", "sip", "simon", "ok", "va", "claro", "perfecto",
 _NO_WORDS = {"2", "no", "nop", "nel"}
 
 
+_OPTIONS_RE = re.compile(r"[ \t]*\n*[ \t]*1\.\s*S[ií]\s*\n\s*2\.\s*No\b[ \t]*")
+_CLOSING_RE = re.compile(r"¿(te funcionó la respuesta|hay algo más en lo que te pueda ayudar)[^?\n]*\?", re.IGNORECASE)
+_CLOSING_EXACT = {"te funcionó la respuesta": "¿Te funcionó la respuesta?",
+                  "hay algo más en lo que te pueda ayudar": "¿Hay algo más en lo que te pueda ayudar?"}
+
+
+def _fix_closing_options(reply: str) -> str:
+    """The dashboard (sp_whatsappAgentDashboard) matches the two closing
+    questions word for word and reads "1. Sí / 2. No" as the answer to them,
+    but Gemini sometimes adds words ("…ayudar, Gilberto?") or numbers other
+    offers ("¿te paso con alguien?"). Put each closing question back to its
+    exact text with the options under it, and drop the options elsewhere."""
+    text = _OPTIONS_RE.sub("", reply).rstrip()
+    text = _CLOSING_RE.sub(lambda m: _CLOSING_EXACT[m.group(1).lower()] + "\n1. Sí\n2. No", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
 def _answer_kind(message: str) -> str | None:
     """"yes"/"no" for a short reply to a 1/2 question, else None."""
     words = re.sub(r"[^\w\s👍]", " ", (message or "").lower()).split()
@@ -1830,6 +1847,7 @@ async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> Wha
 
     pending_action = PendingAction(**pending_raw) if isinstance(pending_raw, dict) else None
     if reply:
+        reply = _fix_closing_options(reply)
         stage, feedback = _conversation_stage(prev_reply, req.message, reply,
                                               pending_action.capability if pending_action else None)
     else:

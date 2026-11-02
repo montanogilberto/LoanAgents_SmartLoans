@@ -8,6 +8,7 @@ from tools.backend_api import (
     get_promotions, get_reservation_hours, get_reservation_services,
 )
 from tools.pending_actions import propose_action
+from tools.safe_tool import never_raise
 
 whatsapp_reservations_agent = Agent(
     name="whatsapp_reservations_agent",
@@ -22,15 +23,17 @@ whatsapp_reservations_agent = Agent(
     ),
     model="gemini-2.5-flash",
     instruction=lambda _ctx: INSTRUCTION,
+    # Read tools never crash the turn: a backend timeout becomes "unavailable" for the model
+    # (tools/safe_tool.py). propose_action reports its own validation errors.
     tools=[
-        FunctionTool(func=get_reservation_services),
-        FunctionTool(func=get_reservation_hours),
-        FunctionTool(func=get_available_slots),
-        FunctionTool(func=get_promotions),
-        FunctionTool(func=get_business_info),
-        FunctionTool(func=get_faqs),
-        FunctionTool(func=get_my_reward_points),
-        FunctionTool(func=get_machine_availability),
+        FunctionTool(func=never_raise(get_reservation_services)),
+        FunctionTool(func=never_raise(get_reservation_hours)),
+        FunctionTool(func=never_raise(get_available_slots)),
+        FunctionTool(func=never_raise(get_promotions)),
+        FunctionTool(func=never_raise(get_business_info)),
+        FunctionTool(func=never_raise(get_faqs)),
+        FunctionTool(func=never_raise(get_my_reward_points)),
+        FunctionTool(func=never_raise(get_machine_availability)),
         FunctionTool(func=propose_action),
     ],
     output_key="whatsapp_reservations_reply",
