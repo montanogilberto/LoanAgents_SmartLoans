@@ -340,7 +340,7 @@ def test_closing_options_only_under_closing_questions():
 def test_closing_questions_put_back_word_for_word():
     from main import _fix_closing_options
     assert _fix_closing_options("¿Hay algo más en lo que te pueda ayudar, Gilberto?") == ASK_MORE
-    assert _fix_closing_options("Listo.\n¿Hay algo más en lo que te pueda ayudar mientras esperas?") == "Listo.\n" + ASK_MORE
+    assert _fix_closing_options("Listo.\n¿Hay algo más en lo que te pueda ayudar mientras esperas?") == "Listo.\n\n" + ASK_MORE
 
 
 def test_read_tools_never_crash_the_turn(monkeypatch):
@@ -369,3 +369,35 @@ def test_wrapped_tools_keep_their_declaration():
     assert tools["get_reservation_services"].func.__doc__
     decl = tools["get_available_slots"]._get_declaration()
     assert decl.name == "get_available_slots" and decl.parameters.properties
+
+
+def test_failed_tool_turn_is_error_without_closing_question(monkeypatch):
+    import main
+    from fastapi.testclient import TestClient
+    from types import SimpleNamespace
+    from google.genai.types import Content, FunctionResponse, Part
+    from tools.safe_tool import UNAVAILABLE
+
+    async def run_async(*, user_id, session_id, new_message):
+        yield SimpleNamespace(partial=False, actions=None, is_final_response=lambda: False,
+                              content=Content(role="user", parts=[Part(function_response=FunctionResponse(
+                                  name="get_reservation_services", response=dict(UNAVAILABLE)))]))
+        yield SimpleNamespace(partial=False, actions=None, is_final_response=lambda: True,
+                              content=Content(role="model", parts=[Part(text=(
+                                  "No pude consultar los servicios en este momento.\n\n" + ASK_FEEDBACK))]))
+    monkeypatch.setattr(main._whatsapp_reservations_runner, "run_async", run_async)
+
+    async def no_topic(*_):
+        return None
+    monkeypatch.setattr(main, "_classify_whatsapp_topic", no_topic)
+    data = TestClient(main.app).post("/support/whatsapp-reservations", json={
+        "companyId": 1, "phone": "5266200099998", "message": "cita"}).json()
+    assert data["conversationStage"] == "error"
+    assert "funcionó" not in data["reply"] and "1. Sí" not in data["reply"]
+    assert data["reply"].endswith("Escríbeme de nuevo en un momento y lo reviso.")
+
+
+def test_closing_question_moves_to_the_end():
+    from main import _fix_closing_options
+    mid = "Entendido. ¿Hay algo más en lo que te pueda ayudar?\n1. Sí\n2. No Si gustas, te paso con alguien."
+    assert _fix_closing_options(mid) == "Entendido. Si gustas, te paso con alguien.\n\n" + ASK_MORE

@@ -1679,10 +1679,15 @@ def _fix_closing_options(reply: str) -> str:
     questions word for word and reads "1. Sí / 2. No" as the answer to them,
     but Gemini sometimes adds words ("…ayudar, Gilberto?") or numbers other
     offers ("¿te paso con alguien?"). Put each closing question back to its
-    exact text with the options under it, and drop the options elsewhere."""
-    text = _OPTIONS_RE.sub("", reply).rstrip()
-    text = _CLOSING_RE.sub(lambda m: _CLOSING_EXACT[m.group(1).lower()] + "\n1. Sí\n2. No", text)
-    return re.sub(r"\n{3,}", "\n\n", text).strip()
+    exact text, last, with the options under it, and drop the options elsewhere."""
+    text = _OPTIONS_RE.sub("", reply)
+    asked = [_CLOSING_EXACT[m.group(1).lower()] for m in _CLOSING_RE.finditer(text)]
+    if not asked:
+        return re.sub(r"\n{3,}", "\n\n", text).strip()
+    # One closing question, always last: written mid-paragraph, its options
+    # ended up inside the sentence ("2. No Si gustas…").
+    text = re.sub(r"\n{3,}", "\n\n", re.sub(r"[ \t]{2,}", " ", _CLOSING_RE.sub("", text))).strip()
+    return (text + "\n\n" if text else "") + asked[-1] + "\n1. Sí\n2. No"
 
 
 def _answer_kind(message: str) -> str | None:
@@ -1828,12 +1833,19 @@ async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> Wha
     # every model text of this turn, joined — not just the last one.
     pending_raw = None
     reply = ""
+    failed_tools = set()  # read tools that answered "unavailable" (tools/safe_tool.py) and weren't retried OK
     for attempt in range(2):
         texts = []
         async for event in _whatsapp_reservations_runner.run_async(user_id=user_id, session_id=session.id, new_message=message):
             delta = event.actions.state_delta if event.actions else {}
             if "pending_action" in delta:
                 pending_raw = delta["pending_action"]
+            for call in (p.function_response for p in ((event.content and event.content.parts) or [])
+                         if p.function_response):
+                if isinstance(call.response, dict) and call.response.get("status") == "unavailable" and "error" in call.response:
+                    failed_tools.add(call.name)
+                else:
+                    failed_tools.discard(call.name)
             if not event.partial and event.content and event.content.role == "model" and event.content.parts:
                 text = "".join(p.text or "" for p in event.content.parts if not getattr(p, "thought", False)).strip()
                 if text:
@@ -1846,7 +1858,15 @@ async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> Wha
             "Responde ahora al último mensaje del cliente siguiendo tus instrucciones.)"))])
 
     pending_action = PendingAction(**pending_raw) if isinstance(pending_raw, dict) else None
-    if reply:
+    if reply and failed_tools:
+        # Nothing was answered: no "¿Te funcionó?" (the customer said "No" to
+        # one after a timeout, 2026-11-02), and the dashboard counts it as a failure.
+        logger.warning("[whatsapp_reservations] tools unavailable this turn: %s", sorted(failed_tools))
+        reply = _CLOSING_RE.sub("", _OPTIONS_RE.sub("", reply)).strip()
+        if "?" not in reply and "de nuevo" not in reply.lower():
+            reply += "\n\nEscríbeme de nuevo en un momento y lo reviso."
+        stage, feedback = "error", None
+    elif reply:
         reply = _fix_closing_options(reply)
         stage, feedback = _conversation_stage(prev_reply, req.message, reply,
                                               pending_action.capability if pending_action else None)
