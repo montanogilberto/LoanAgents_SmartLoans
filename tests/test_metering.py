@@ -189,3 +189,41 @@ def test_middleware_context_does_not_leak_between_requests():
     client, seen = _app()
     client.post("/support/pos-income", json={"companyId": 7})
     assert metering._company_id.get() is None
+
+
+def test_meter_derives_live_output_from_the_total():
+    """Gemini Live's response_token_count is dropped by ADK; only total_token_count survives."""
+    from google.adk.models.llm_response import LlmResponse
+    from google.genai import types
+    live = LlmResponse(usage_metadata=types.UsageMetadata(
+        prompt_token_count=1000, response_token_count=300, thoughts_token_count=50, total_token_count=1350))
+    m = _meter()
+    m.add(live)
+    assert (m.input_tokens, m.output_tokens, m.thoughts_tokens) == (1000, 300, 50)
+
+
+def test_live_runner_bills_the_whole_call_once():
+    runner = MeteredRunner.__new__(MeteredRunner)
+    runner.agent = SimpleNamespace(name="voice_secretary_agent", model="gemini-live")
+
+    async def fake_run_live(self, *a, **k):
+        yield _event(1000, 100, 0)
+        yield _event(1200, 80, 10)
+
+    flushed = []
+
+    async def fake_flush(self):
+        flushed.append(self.payload()["tokens"][0])
+
+    async def go():
+        tokens = metering.bind_metering(7, "/voice/twilio-stream")
+        try:
+            return [e async for e in runner.run_live(live_request_queue=None)]
+        finally:
+            metering.unbind_metering(tokens)
+
+    with mock.patch.object(Runner, "run_live", fake_run_live), mock.patch.object(UsageMeter, "flush", fake_flush):
+        out = asyncio.run(go())
+    assert len(out) == 2
+    assert flushed == [{"companyId": 7, "agentName": "voice_secretary_agent", "endpointName": "/voice/twilio-stream",
+                        "model": "gemini-live", "inputTokens": 2200, "outputTokens": 180, "thoughtsTokens": 10}]

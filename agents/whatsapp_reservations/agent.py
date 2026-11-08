@@ -1,4 +1,6 @@
 """WhatsApp Reservations Agent definition."""
+import inspect
+
 from google.adk.agents import Agent
 from google.adk.tools import FunctionTool
 
@@ -9,6 +11,19 @@ from tools.backend_api import (
 )
 from tools.pending_actions import propose_action
 from tools.safe_tool import never_raise
+
+
+def _use_trusted_ids(tool, args, tool_context):
+    """company_id / branch_id always come from the route (the WhatsApp number
+    the customer wrote to), never from the model: business data now includes
+    the CLABE customers send money to, so a wrong id would show another
+    company's account."""
+    params = inspect.signature(tool.func).parameters
+    for arg, state_key in (("company_id", "wa_company_id"), ("branch_id", "wa_branch_id")):
+        if arg in params:
+            args[arg] = tool_context.state.get(state_key)
+    return None
+
 
 whatsapp_reservations_agent = Agent(
     name="whatsapp_reservations_agent",
@@ -36,5 +51,6 @@ whatsapp_reservations_agent = Agent(
         FunctionTool(func=never_raise(get_machine_availability)),
         FunctionTool(func=propose_action),
     ],
+    before_tool_callback=_use_trusted_ids,
     output_key="whatsapp_reservations_reply",
 )

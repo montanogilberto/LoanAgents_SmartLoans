@@ -56,7 +56,15 @@ class UsageMeter:
         if usage is None:
             return
         self.input_tokens += _tokens(usage, "prompt_token_count")
-        self.output_tokens += _tokens(usage, "candidates_token_count")
+        output = _tokens(usage, "candidates_token_count")
+        if not output:
+            # Gemini Live reports output as response_token_count, which ADK drops when it
+            # copies the usage into GenerateContentResponseUsageMetadata — only the total
+            # survives, so output is what the total has beyond the input and thoughts.
+            output = _tokens(usage, "response_token_count") or max(0, _tokens(usage, "total_token_count")
+                - _tokens(usage, "prompt_token_count") - _tokens(usage, "thoughts_token_count")
+                - _tokens(usage, "tool_use_prompt_token_count"))
+        self.output_tokens += output
         self.thoughts_tokens += _tokens(usage, "thoughts_token_count")
 
     @property
@@ -103,6 +111,7 @@ class MeteredRunner(Runner):
     async def run_async(self, *args, **kwargs):
         agent = getattr(self, "agent", None)
         model = getattr(agent, "model", "") or ""
+        model = getattr(model, "model", model)   # a model object (e.g. LiveGemini) → its name
         meter = UsageMeter(
             company_id=_company_id.get(),
             endpoint=_endpoint.get(),
@@ -115,6 +124,37 @@ class MeteredRunner(Runner):
                 yield event
         finally:
             await meter.flush()
+
+    async def run_live(self, *args, **kwargs):
+        """Live (voice) sessions: one usage record per call. A WebSocket doesn't
+        pass through metering_middleware, so the route sets the company with
+        bind_metering() before starting the call."""
+        agent = getattr(self, "agent", None)
+        model = getattr(agent, "model", "") or ""
+        model = getattr(model, "model", model)   # a model object (e.g. LiveGemini) → its name
+        meter = UsageMeter(
+            company_id=_company_id.get(),
+            endpoint=_endpoint.get(),
+            agent_name=getattr(agent, "name", "") or "",
+            model=model if isinstance(model, str) else str(model),
+        )
+        try:
+            async for event in super().run_live(*args, **kwargs):
+                meter.add(event)
+                yield event
+        finally:
+            await meter.flush()
+
+
+def bind_metering(company_id: int | None, endpoint: str):
+    """For routes the HTTP middleware doesn't see (WebSockets). Returns tokens for unbind_metering."""
+    return _company_id.set(company_id), _endpoint.set(endpoint)
+
+
+def unbind_metering(tokens) -> None:
+    company_token, endpoint_token = tokens
+    _company_id.reset(company_token)
+    _endpoint.reset(endpoint_token)
 
 
 async def metering_middleware(request, call_next):
