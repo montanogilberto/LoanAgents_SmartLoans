@@ -12,6 +12,7 @@ from agents.evidence_validation import evidence_validation_agent
 from agents.cash_register import cash_register_agent
 from agents.expense import expense_agent
 from agents.ticket_extraction import ticket_extraction_agent
+from agents.transfer_extraction import transfer_extraction_agent
 from agents.product_extraction import product_extraction_agent
 from agents.product_web_lookup import product_web_lookup_agent
 from agents.client_followup import client_followup_agent
@@ -22,6 +23,7 @@ from agents.pos_expenses_support import pos_expenses_support_agent
 from agents.pos_accounting_support import pos_accounting_support_agent
 from agents.pos_rewards_support import pos_rewards_support_agent
 from agents.whatsapp_reservations import whatsapp_reservations_agent
+from agents.voice_secretary import voice_secretary_agent
 from agents.whatsapp_topic import whatsapp_topic_agent
 from agents.whatsapp_insights import whatsapp_insights_agent
 
@@ -52,6 +54,7 @@ __all__ = [
     "pos_accounting_support_agent",
     "pos_rewards_support_agent",
     "whatsapp_reservations_agent",
+    "voice_secretary_agent",
     "whatsapp_topic_agent",
     "whatsapp_insights_agent",
     "root_agent",

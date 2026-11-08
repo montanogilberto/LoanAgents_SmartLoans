@@ -30,7 +30,7 @@ from google.genai.types import Content, Part
 
 from agents import (
     orchestrator_agent, contract_agent, id_document_agent, face_validation_agent,
-    analysis_agent, evidence_validation_agent, cash_register_agent, expense_agent,
+    analysis_agent, evidence_validation_agent, transfer_extraction_agent, cash_register_agent, expense_agent,
     ticket_extraction_agent, client_followup_agent, order_triage_agent, pos_clients_support_agent,
     pos_income_support_agent, pos_expenses_support_agent, pos_accounting_support_agent,
     pos_rewards_support_agent, whatsapp_reservations_agent, product_extraction_agent,
@@ -38,6 +38,7 @@ from agents import (
 )
 from agents.support import support_agent
 from agents.whatsapp_topic.prompt import TOPICS as WHATSAPP_TOPICS
+from agents.transfer_extraction.reconcile import review_extraction
 from agents.ticket_extraction.matching import MATCHED, UNAVAILABLE, match_product, match_supplier, parse_pack
 from agents.ticket_extraction.proposal import build_proposal, evaluate
 from agents.ticket_extraction.reconcile import normalize_line_items, payment_label, reconcile
@@ -46,6 +47,7 @@ from agents.product_web_lookup.reconcile import reconcile_web_lookup
 from config.settings import PORT
 from intake_api import router as intake_router
 from site_commercial.routes import router as site_router
+from voice.twilio_bridge import router as voice_router
 from metering import MeteredRunner, metering_middleware
 from tools.backend_api import get_credit_score, get_client_loans, list_products, list_suppliers
 
@@ -110,6 +112,8 @@ app.add_middleware(
 # leads and lead follow-up (see intake_api.py and site_commercial/).
 app.include_router(intake_router)
 app.include_router(site_router)
+# Live phone calls: Twilio Media Streams <-> Gemini Live (voice/twilio_bridge.py).
+app.include_router(voice_router)
 
 
 def _strip_json_fences(text: str) -> str:
@@ -149,6 +153,7 @@ _contract_runner = MeteredRunner(agent=contract_agent, app_name="loan_agents_con
 _id_extraction_runner = MeteredRunner(agent=id_document_agent, app_name="loan_agents_id", session_service=_session_service)
 _face_validation_runner = MeteredRunner(agent=face_validation_agent, app_name="loan_agents_face", session_service=_session_service)
 _analysis_runner = MeteredRunner(agent=analysis_agent, app_name="loan_agents_analysis", session_service=_session_service)
+_transfer_extraction_runner = MeteredRunner(agent=transfer_extraction_agent, app_name="loan_agents_transfer", session_service=_session_service)
 _evidence_runner = MeteredRunner(agent=evidence_validation_agent, app_name="loan_agents_evidence", session_service=_session_service)
 _cash_register_runner = MeteredRunner(agent=cash_register_agent, app_name="loan_agents_cash_register", session_service=_session_service)
 _expense_runner = MeteredRunner(agent=expense_agent, app_name="loan_agents_expense", session_service=_session_service)
@@ -795,6 +800,51 @@ async def validate_transfer_evidence(req: ValidateTransferEvidenceRequest) -> Va
         mismatches=result.get("mismatches", []),
         failureReasons=result.get("failureReasons", []),
     )
+
+
+class ExtractTransferRequest(BaseModel):
+    evidenceUrl: str | None = None
+    evidenceBase64: str | None = None
+
+
+class ExtractTransferResponse(BaseModel):
+    isTransferReceipt: bool = False
+    confidence: float = 0.0
+    amountMXN: float = 0.0
+    claveRastreo: str = ""
+    transferDate: str = ""
+    bankFrom: str = ""
+    issues: list[str] = []
+    needsReview: bool = True
+
+
+@app.post("/transfers/extract-evidence", response_model=ExtractTransferResponse)
+async def extract_transfer_evidence(req: ExtractTransferRequest) -> ExtractTransferResponse:
+    """Reads a SPEI receipt to pre-fill the cashier's form. Advisory only: it never
+    credits money, and anything unreadable comes back empty with needsReview=true."""
+    evidence_bytes = await _resolve_image(req.evidenceUrl, req.evidenceBase64)
+    if not evidence_bytes:
+        raise HTTPException(status_code=400, detail="evidenceUrl or evidenceBase64 is required")
+
+    message = Content(role="user", parts=[
+        Part.from_bytes(data=evidence_bytes, mime_type="image/jpeg"),
+        Part(text="Lee este comprobante de transferencia."),
+    ])
+    user_id = f"transfer-{uuid.uuid4()}"
+    session = await _session_service.create_session(
+        app_name="loan_agents_transfer", user_id=user_id, state={"transfer_extraction_result": "{}"},
+    )
+    async for _event in _transfer_extraction_runner.run_async(
+            user_id=user_id, session_id=session.id, new_message=message):
+        pass
+    updated = await _session_service.get_session(
+        app_name="loan_agents_transfer", user_id=user_id, session_id=session.id)
+    raw = updated.state.get("transfer_extraction_result", "{}")
+    try:
+        result = json.loads(_strip_json_fences(raw)) if isinstance(raw, str) else raw
+    except json.JSONDecodeError:
+        result = {}
+    return ExtractTransferResponse(**review_extraction(result or {}, datetime.now(timezone(timedelta(hours=-7))).date()))
 
 
 class CashRegisterReviewRequest(BaseModel):
@@ -1674,6 +1724,12 @@ _CLOSING_EXACT = {"te funcionó la respuesta": "¿Te funcionó la respuesta?",
                   "hay algo más en lo que te pueda ayudar": "¿Hay algo más en lo que te pueda ayudar?"}
 
 
+def _drop_dangling(text: str) -> str:
+    """"Mientras esperas," left alone once its question moved or went away
+    (seen 4 times in 10 live runs, 2026-11-07)."""
+    return re.sub(r"(?:^|(?<=[.!?\n]))[^.!?\n]*,\s*$", "", text).strip()
+
+
 def _fix_closing_options(reply: str) -> str:
     """The dashboard (sp_whatsappAgentDashboard) matches the two closing
     questions word for word and reads "1. Sí / 2. No" as the answer to them,
@@ -1683,10 +1739,10 @@ def _fix_closing_options(reply: str) -> str:
     text = _OPTIONS_RE.sub("", reply)
     asked = [_CLOSING_EXACT[m.group(1).lower()] for m in _CLOSING_RE.finditer(text)]
     if not asked:
-        return re.sub(r"\n{3,}", "\n\n", text).strip()
+        return _drop_dangling(re.sub(r"\n{3,}", "\n\n", text).strip())
     # One closing question, always last: written mid-paragraph, its options
     # ended up inside the sentence ("2. No Si gustas…").
-    text = re.sub(r"\n{3,}", "\n\n", re.sub(r"[ \t]{2,}", " ", _CLOSING_RE.sub("", text))).strip()
+    text = _drop_dangling(re.sub(r"\n{3,}", "\n\n", re.sub(r"[ \t]{2,}", " ", _CLOSING_RE.sub("", text))).strip())
     return (text + "\n\n" if text else "") + asked[-1] + "\n1. Sí\n2. No"
 
 
@@ -1714,10 +1770,143 @@ def _conversation_stage(prev_reply: str, message: str, reply: str,
         return "feedback_asked", feedback
     if _MORE_QUESTION in low:
         return "more_asked", feedback
-    # A goodbye: the customer declined more help and the reply asks nothing.
+    # A goodbye: the customer said thanks/bye (not a "no" to "¿Te funcionó?"),
+    # or declined more help, and the reply asks nothing.
+    if "?" not in low and _closes_chat(prev_reply, message):
+        return "closed", feedback
     if "?" not in low and "?" in prev and (_MORE_QUESTION in prev or _answer_kind(message) == "no"):
         return "closed", feedback
     return "open", feedback
+
+
+# Goodbyes are told apart in code, not by the model: Gemini kept answering
+# "Dios la bendiga, buenas noches" with "¿Hay algo más…?" and a promotion
+# (2026-11-07). A message counts only if EVERY word is a courtesy word, so
+# "gracias, ¿y el sábado abren?" is still a question.
+_THANKS = {"gracias", "gracia", "grcia", "grcias", "gracis", "grasias", "grax", "grasia"}
+_ACK_WORDS = _THANKS | {"ok", "okey", "okay", "oki", "va", "sale", "igualmente", "igual", "listo",
+                        "perfecto", "bueno", "si", "sí", "claro", "excelente", "muchas", "mil", "bien",
+                        "esta", "está", "asi", "así", "👍", "🙏"}
+_FAREWELL_WORDS = _ACK_WORDS | {
+    "muchísimas", "muchisimas", "buenas", "buena", "buen", "noches", "noche", "tardes", "tarde", "dias",
+    "días", "dia", "día", "hasta", "mañana", "manana", "luego", "pronto", "nos", "vemos", "bye", "bay",
+    "bai", "adios", "adiós", "chao", "chau", "que", "qué", "dios", "la", "le", "lo", "te", "les", "los",
+    "bendiga", "bendice", "siempre", "ti", "usted", "a", "no", "muy", "amable", "amables", "es", "todo",
+    "eso", "seria", "sería", "sera", "será", "saludos", "cuidese", "cuídese", "cuidate", "cuídate",
+    "gusto", "un", "una", "el", "y", "o", "como", "de", "nada", "descanse", "descansa", "feliz", "fin",
+    "semana", "por", "su", "tu", "atencion", "atención", "ayuda", "servicio", "ah"}
+_CLOSING_ONLY_WORDS = _FAREWELL_WORDS - _ACK_WORDS - {
+    "muchísimas", "muchisimas", "la", "le", "lo", "te", "les", "los", "a", "no", "es", "eso", "un",
+    "una", "el", "y", "o", "como", "de", "que", "qué", "su", "tu", "por", "ti", "usted", "muy", "todo",
+    "ah"}
+
+
+def _courtesy_words(message: str) -> list[str] | None:
+    """The message's words when it is ONLY courtesy (no question), else None."""
+    text = (message or "").lower()
+    if "?" in text or "¿" in text:
+        return None
+    words = re.sub(r"[^\w\s👍🙏]", " ", text).replace("👍", " 👍 ").replace("🙏", " 🙏 ").split()
+    # "graciaas", "okk", "siii": stretched letters and typos are still thanks.
+    words = [re.sub(r"([a-záéíóúñ])\1+", r"\1", w) for w in words]
+    return words if words and len(words) <= 14 and all(w in _FAREWELL_WORDS for w in words) else None
+
+
+def _is_ack(message: str) -> bool:
+    """"ok", "gracias", "👍", a ❤️ — nothing to answer once the chat is closed."""
+    if _is_reaction(message):
+        return True
+    words = _courtesy_words(message)
+    return bool(words) and len(words) <= 3 and all(w in _ACK_WORDS for w in words)
+
+
+def _is_reaction(message: str) -> bool:
+    """A WhatsApp reaction, or a message of only emojis: never a question."""
+    text = (message or "").strip()
+    return text == "[reaction]" or (bool(text) and not re.search(r"[\w?¿]", text))
+
+
+def _is_farewell(message: str) -> bool:
+    """Thanks or a goodbye and nothing else: "Dios la bendiga, nos vemos", "Es todo mañana, gracias"."""
+    words = _courtesy_words(message)
+    return bool(words) and any(w in _CLOSING_ONLY_WORDS or w in _THANKS for w in words) \
+        or bool(words) and len(words) >= 2 and "bien" in words
+
+
+_NAME_PART = re.compile(r"^[a-záéíóúüñ][a-záéíóúüñ'.-]{0,14}$", re.IGNORECASE)
+
+
+def _clean_customer_name(name: str | None) -> str | None:
+    """The WhatsApp profile name if it reads as a person's name, else None.
+    "salvadoorvalenzuela" (a username) was used to greet a customer; one
+    unreadable word drops the whole name, so the agent just doesn't use one."""
+    parts = re.sub(r"[^\w\s'.-]", " ", name or "").split()
+    if not parts or len(parts) > 4 or not all(_NAME_PART.match(p) for p in parts):
+        return None
+    if all(p.islower() for p in parts):
+        parts = [p[:1].upper() + p[1:] for p in parts]
+    return " ".join(parts)
+
+
+def _closes_chat(prev_reply: str, message: str) -> bool:
+    """The customer is ending the chat. Not a "no" to "¿Te funcionó?": it didn't
+    work. "Sí, muy bien, gracias" to "¿algo más?" is thanks, not a request
+    (a customer who wants more says what, or just "sí")."""
+    if not _is_farewell(message):
+        return False
+    prev = (prev_reply or "").lower()
+    if _FEEDBACK_QUESTION in prev and _answer_kind(message) == "no":
+        return False
+    return True
+
+
+# Chats whose last reply was a goodbye: a later bare "ok" gets no answer at all
+# (the backend sends nothing for an empty reply). In process, like the sessions.
+_CLOSED_WHATSAPP_CHATS: set[str] = set()
+# Chats handed to a person (a complaint, a closed branch): no promotions in them
+# unless the customer asks — 3 of 5 live goodbyes still sold the 2x1 to a
+# customer standing outside a closed branch, despite the prompt (2026-11-07).
+_HANDOFF_WHATSAPP_CHATS: set[str] = set()
+_ANY_MORE_QUESTION = re.compile(r"¿[^?¿]*\balgo más\b[^?¿]*\?", re.IGNORECASE)
+# "Te responderán por aquí", "Ya pasé tu mensaje al equipo": a promise that a
+# person will follow up. Gemini made one without proposing REQUEST_HUMAN in 1
+# of 3 live runs (2026-11-07), so nobody was told — the route makes it true.
+_PROMISES_A_PERSON = re.compile(
+    r"(equipo|alguien|una persona|encargad\w*|personal)[^.?!\n]{0,90}"
+    r"(contact\w*|respond\w*|comunic\w*|avis\w*|atender\w*|atiend\w*|escrib\w*|revis\w*)"
+    r"|(pas[eéo]|pasar|notifiqu\w*|notifiqué|avis[eé]) (tu|su) (mensaje|caso|aviso|reporte)", re.IGNORECASE)
+
+
+def _promises_a_person(reply: str) -> bool:
+    """A statement (not an offer like "¿te paso con alguien?") that a person will follow up."""
+    sentences = re.split(r"(?<=[.!?])\s+|\n+", reply or "")
+    return any(_PROMISES_A_PERSON.search(s) and "?" not in s for s in sentences)
+_GOODBYE_FALLBACK = "¡Con gusto! Que estés muy bien. 😊"
+_PROMO_SENTENCE = re.compile(r"[^.!?\n]*\b(promo\w*|c[oó]digo|descuento\w*)\b[^.!?\n]*[.!?]*", re.IGNORECASE)
+
+
+def _goodbye_only(reply: str) -> str:
+    """A goodbye reply without the closing questions or a promotion (Gemini
+    still added "Le recordamos la promoción…" to 1 goodbye in 20, 2026-11-07)."""
+    text = _CLOSING_RE.sub("", _OPTIONS_RE.sub("", reply))
+    text = _drop_dangling(re.sub(r"[ \t]{2,}", " ", _PROMO_SENTENCE.sub("", text)).strip())
+    return text or _GOODBYE_FALLBACK
+
+
+_NEW_CUSTOMER_PROMO = re.compile(
+    r"[^.!?\n]*\b(promo\w*|c[oó]digo|2x1)\b[^.!?\n]*\b(primera compra|nuev[oa]s?|primera vez)\b[^.!?\n]*[.!?]*",
+    re.IGNORECASE)
+
+
+def _without_new_customer_promo(reply: str) -> str:
+    """The goodbye kept selling a first-purchase-only 2x1 to whoever said "no"
+    to "¿algo más?" (4 of 4 live runs, despite the prompt) — most of them are
+    regulars. Other promotions stay."""
+    return _drop_dangling(re.sub(r"[ \t]{2,}", " ", _NEW_CUSTOMER_PROMO.sub("", reply)).strip())
+
+
+def _without_promotions(reply: str) -> str:
+    return _drop_dangling(re.sub(r"\n{3,}", "\n\n", _PROMO_SENTENCE.sub("", reply)).strip())
 
 
 _WEEKDAYS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
@@ -1789,6 +1978,11 @@ async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> Wha
     if existing is not None and time.time() - existing.last_update_time > _WHATSAPP_SESSION_IDLE_SECONDS:
         await _session_service.delete_session(
             app_name="loan_agents_whatsapp_reservations", user_id=user_id, session_id=user_id)
+        _CLOSED_WHATSAPP_CHATS.discard(user_id)
+        _HANDOFF_WHATSAPP_CHATS.discard(user_id)
+    if _is_reaction(req.message) or (user_id in _CLOSED_WHATSAPP_CHATS and _is_ack(req.message)):
+        # A reaction is never answered, and an "ok" after a goodbye doesn't reopen the chat.
+        return WhatsAppReservationsResponse(reply="", conversationStage="closed")
     session = await _get_or_create_pos_session(
         app_name="loan_agents_whatsapp_reservations",
         user_id=user_id,
@@ -1812,7 +2006,7 @@ async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> Wha
         "companyName": req.companyName,
         "branchId": req.branchId,
         "branchName": req.branchName,
-        "customerName": req.customerName,
+        "customerName": _clean_customer_name(req.customerName),
         "today": now_local.date().isoformat(),
         "nowTime": now_local.strftime("%H:%M"),
         "nextDays": [
@@ -1867,12 +2061,36 @@ async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> Wha
             reply += "\n\nEscríbeme de nuevo en un momento y lo reviso."
         stage, feedback = "error", None
     elif reply:
+        handoff = isinstance(pending_raw, dict) and pending_raw.get("capability") == "REQUEST_HUMAN"
+        if (not handoff and not pending_raw and user_id not in _HANDOFF_WHATSAPP_CHATS
+                and _promises_a_person(reply)):
+            logger.warning("[whatsapp_reservations] reply promised a person without REQUEST_HUMAN: handing off")
+            pending_raw = {"capability": "REQUEST_HUMAN", "fields": {"reason": f"El cliente escribió: {req.message[:150]}"},
+                           "confirmationSummary": "Atención de una persona"}
+            handoff = True
+            pending_action = PendingAction(**pending_raw)
+        if handoff:
+            _HANDOFF_WHATSAPP_CHATS.add(user_id)
+        if user_id in _HANDOFF_WHATSAPP_CHATS:
+            # Waiting for a person: no "¿Hay algo más…?" / "¿Te funcionó?" in any wording.
+            reply = _drop_dangling(_ANY_MORE_QUESTION.sub("", _CLOSING_RE.sub("", _OPTIONS_RE.sub("", reply))).strip()) or reply
+        if user_id in _HANDOFF_WHATSAPP_CHATS and "promo" not in req.message.lower():
+            reply = _without_promotions(reply) or _GOODBYE_FALLBACK
+        if _MORE_QUESTION in prev_reply.lower() and _answer_kind(req.message) == "no":
+            reply = _without_new_customer_promo(reply) or _GOODBYE_FALLBACK
+        if _closes_chat(prev_reply, req.message) and not pending_raw:
+            # A goodbye never asks "¿Te funcionó?" / "¿algo más?" back.
+            reply = _goodbye_only(reply)
         reply = _fix_closing_options(reply)
         stage, feedback = _conversation_stage(prev_reply, req.message, reply,
                                               pending_action.capability if pending_action else None)
     else:
         reply = "Perdón, se me complicó responderte. ¿Me lo puedes escribir de otra forma?"
         stage, feedback = "error", None
+    if stage == "closed":
+        _CLOSED_WHATSAPP_CHATS.add(user_id)
+    else:
+        _CLOSED_WHATSAPP_CHATS.discard(user_id)
     return WhatsAppReservationsResponse(reply=reply, pendingAction=pending_action, topic=await topic_task,
                                         conversationStage=stage, feedback=feedback)
 

@@ -24,14 +24,19 @@ def _to_hermosillo(iso: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00")) - _HERMOSILLO_OFFSET
 
 
+def _headers() -> dict:
+    """Identifies this service to the backend, which will soon refuse anonymous calls."""
+    return {"X-Worker-Key": WORKER_KEY} if WORKER_KEY else {}
+
+
 def _post(path: str, body: dict) -> dict:
-    resp = httpx.post(f"{SMARTLOANS_BACKEND_URL}{path}", json=body, timeout=_TIMEOUT)
+    resp = httpx.post(f"{SMARTLOANS_BACKEND_URL}{path}", json=body, headers=_headers(), timeout=_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
 
 
 def _get(path: str) -> dict:
-    resp = httpx.get(f"{SMARTLOANS_BACKEND_URL}{path}", timeout=_TIMEOUT)
+    resp = httpx.get(f"{SMARTLOANS_BACKEND_URL}{path}", headers=_headers(), timeout=_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
 
@@ -681,12 +686,18 @@ def get_promotions(company_id: int) -> list[dict]:
 
     Returns:
         [{"code": str, "name": str, "promoType": str, "description": str|None,
-        "startAtUtc": str|None, "endAtUtc": str|None}]. Empty = no promotions now.
+        "startAtUtc": str|None, "endAtUtc": str|None,
+        "firstPurchaseOnly": bool}]. Empty = no promotions now.
+        firstPurchaseOnly: the POS rejects it on any purchase but the
+        customer's first — an existing customer can't use it.
     """
     result = _post("/promotions", {"promotions": [{"companyId": company_id, "activeOnly": True}]})
     rows = result.get("result", []) if isinstance(result, dict) else []
     promos = (rows[0].get("promotions") or []) if rows else []
-    return [{k: p.get(k) for k in ("code", "name", "promoType", "description", "startAtUtc", "endAtUtc")}
+    # firstPurchaseOnly was dropped here, so a "2x1 todos los servicios" only for
+    # new customers was offered to a regular (2026-11-07).
+    return [{**{k: p.get(k) for k in ("code", "name", "promoType", "description", "startAtUtc", "endAtUtc")},
+             "firstPurchaseOnly": bool(p.get("firstPurchaseOnly"))}
             for p in promos]
 
 
@@ -802,7 +813,7 @@ def get_machine_availability(tool_context: ToolContext) -> dict:
     Returns:
         {"status": "ok", "available": int, "inUse": int, "outOfService": int,
          "machines": [{"name", "type": Lavadora|Secadora|Lavadora-secadora,
-                       "state": disponible|en_uso|fuera_de_servicio,
+                       "state": disponible|en_uso|fuera_de_servicio|sin_datos,
                        "minutesLeft": int | None}]}   (minutesLeft only for en_uso
                        when known; free machines first, then by minutesLeft)
         {"status": "no_machines"} — the business has no connected machines.
@@ -840,8 +851,13 @@ def _machine_availability(devices: list[dict], uses: list[dict], branch_id, now:
             if left > 0:
                 minutes_left = int(left) + (1 if left % 1 else 0)
         status = (d.get("lastStatus") or "").lower()
-        if not d.get("isOnline") or status == "error":
+        # No heartbeat only means we can't see it: it may be running. Calling it
+        # "fuera de servicio" told a customer standing next to 4 busy washers
+        # that none worked (2026-11-07).
+        if status == "error":
             state = "fuera_de_servicio"
+        elif not d.get("isOnline"):
+            state = "sin_datos"
         elif minutes_left is not None or status == "running":
             state = "en_uso"
         else:
@@ -850,12 +866,13 @@ def _machine_availability(devices: list[dict], uses: list[dict], branch_id, now:
                          "type": _MACHINE_TYPE_ES.get(d.get("machineType"), d.get("machineType")),
                          "state": state, "minutesLeft": minutes_left if state == "en_uso" else None})
 
-    order = {"disponible": 0, "en_uso": 1, "fuera_de_servicio": 2}
+    order = {"disponible": 0, "en_uso": 1, "sin_datos": 2, "fuera_de_servicio": 3}
     machines.sort(key=lambda m: (order[m["state"]], m["minutesLeft"] if m["minutesLeft"] is not None else 10**6))
     return {
         "status": "ok",
         "available": sum(m["state"] == "disponible" for m in machines),
         "inUse": sum(m["state"] == "en_uso" for m in machines),
         "outOfService": sum(m["state"] == "fuera_de_servicio" for m in machines),
+        "noData": sum(m["state"] == "sin_datos" for m in machines),
         "machines": machines,
     }

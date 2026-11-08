@@ -173,6 +173,22 @@ CONTRACTS: dict[str, Contract] = {
             FieldSpec("notes", str, required=False),
         ),
     ),
+    "PICKUP_AGREEMENT": Contract(
+        capability="PICKUP_AGREEMENT",
+        description="agents/voice_secretary — how and when a customer gets a finished order, agreed on a phone call; the backend asks the customer to confirm it by WhatsApp",
+        fields=(
+            FieldSpec("deliveryMode", str, required=True, enum=("pickup", "delivery")),
+            # The day the customer agreed to, said aloud; checked against `date` by
+            # agents/voice_secretary/calendar_check.py (the model mapped weekdays wrong).
+            FieldSpec("weekday", str, required=True,
+                      enum=("lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo")),
+            FieldSpec("date", str, required=True, pattern=r"\d{4}-\d{2}-\d{2}"),
+            FieldSpec("time", str, required=True, pattern=r"([01]\d|2[0-3]):[0-5]\d"),
+            FieldSpec("address", str, required=lambda f: f.get("deliveryMode") == "delivery"),
+            FieldSpec("paymentMethod", str, required=False),
+            FieldSpec("notes", str, required=False),
+        ),
+    ),
 }
 
 

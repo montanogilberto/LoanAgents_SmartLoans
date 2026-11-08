@@ -218,13 +218,14 @@ def test_machine_availability_states_and_order():
     uses = [_use(1, "2026-11-02T02:30:00"), _use(2, "2026-11-02T01:00:00"),
             _use(2, "2026-11-02T02:50:00", status="rejected")]
     r = _machine_availability(devices, uses, None, _NOW)
-    assert (r["available"], r["inUse"], r["outOfService"]) == (1, 2, 2)
+    assert (r["available"], r["inUse"], r["outOfService"], r["noData"]) == (1, 2, 1, 1)
     by_name = {m["name"]: m for m in r["machines"]}
     assert "Lavadora 4" not in by_name
     assert by_name["Lavadora 1"] == {"name": "Lavadora 1", "type": "Lavadora", "state": "en_uso", "minutesLeft": 15}
     assert by_name["Lavadora 2"]["state"] == "disponible"           # rejected charge doesn't start a cycle
     assert by_name["Lavadora 5"] == {"name": "Lavadora 5", "type": "Lavadora", "state": "en_uso", "minutesLeft": None}
-    assert by_name["Secadora 1"]["state"] == by_name["Lavadora 3"]["state"] == "fuera_de_servicio"
+    assert by_name["Lavadora 3"]["state"] == "fuera_de_servicio"
+    assert by_name["Secadora 1"]["state"] == "sin_datos"          # offline: unknown, not broken
     assert [m["name"] for m in r["machines"]][:3] == ["Lavadora 2", "Lavadora 1", "Lavadora 5"]
 
 
@@ -401,3 +402,252 @@ def test_closing_question_moves_to_the_end():
     from main import _fix_closing_options
     mid = "Entendido. ¿Hay algo más en lo que te pueda ayudar?\n1. Sí\n2. No Si gustas, te paso con alguien."
     assert _fix_closing_options(mid) == "Entendido. Si gustas, te paso con alguien.\n\n" + ASK_MORE
+
+
+def test_prompt_payment_info_comes_from_business_data_and_never_confirms():
+    from agents.whatsapp_reservations.prompt import INSTRUCTION
+    assert "answer only from paymentMethods" in INSTRUCTION
+    assert "You can't take, charge or confirm a payment here" in INSTRUCTION
+    assert "never say it was received" in INSTRUCTION
+
+
+def test_tools_use_the_routes_company_and_branch_never_the_models():
+    from types import SimpleNamespace
+    from google.adk.tools import FunctionTool
+    from agents.whatsapp_reservations.agent import _use_trusted_ids, whatsapp_reservations_agent
+    from tools.backend_api import get_business_info, get_promotions, get_my_reward_points
+    assert whatsapp_reservations_agent.before_tool_callback is _use_trusted_ids
+    ctx = SimpleNamespace(state={"wa_company_id": 1, "wa_branch_id": 7})
+
+    args = {"company_id": 1008, "branch_id": 99}
+    assert _use_trusted_ids(FunctionTool(func=get_business_info), args, ctx) is None
+    assert args == {"company_id": 1, "branch_id": 7}
+
+    args = {"company_id": 1008}  # a tool with no branch_id doesn't gain one
+    _use_trusted_ids(FunctionTool(func=get_promotions), args, ctx)
+    assert args == {"company_id": 1}
+
+    args = {}
+    _use_trusted_ids(FunctionTool(func=get_my_reward_points), args, ctx)
+    assert args == {}
+
+
+# ── Goodbyes and customer names (2026-11-07 review: the agent kept asking
+# "¿Hay algo más…?" and repeating a promotion after the customer said bye) ──
+
+def test_goodbyes_from_the_review_are_recognized():
+    from main import _is_farewell
+    for message in ("Gracias a usted Dios la bendiga siempre nos vemos bay", "Ok como o claro gracias",
+                    "No muy amable. Buenas noches", "Es todo mañana. Nos vemos gracias", "gracias 🙏",
+                    "Muchas gracias!!"):
+        assert _is_farewell(message), message
+
+
+def test_questions_and_requests_are_not_goodbyes():
+    from main import _is_farewell
+    for message in ("gracias, ¿y el sábado abren?", "gracias, quiero reservar mañana", "ok", "1", "2",
+                    "no", "buenas, a qué hora abren", "hola", ""):
+        assert not _is_farewell(message), message
+
+
+def test_only_bare_acknowledgments_are_silenced():
+    from main import _is_ack
+    for message in ("ok", "Ok 👍", "gracias", "igualmente", "va"):
+        assert _is_ack(message), message
+    for message in ("ok, quiero otra cita", "buenas noches", "Es todo mañana. Nos vemos gracias", "¿ok?"):
+        assert not _is_ack(message), message
+
+
+def test_closing_respects_the_closing_questions():
+    from main import _closes_chat
+    assert _closes_chat(ASK_MORE, "No muy amable. Buenas noches")
+    assert _closes_chat(ASK_FEEDBACK, "gracias")
+    assert not _closes_chat(ASK_FEEDBACK, "no gracias")     # it didn't work
+    assert _closes_chat(ASK_MORE, "Si muy bien muchas gracias")  # Ana, 2026-11-07: thanks, not a request
+    assert not _closes_chat(ASK_MORE, "sí")                 # a bare yes wants more
+    assert _closes_chat("", "sí gracias")                   # nothing was asked: just thanks
+
+
+def test_goodbye_closes_the_stage():
+    from main import _conversation_stage
+    assert _conversation_stage(ASK_MORE, "Es todo mañana. Nos vemos gracias", "¡Hasta mañana! 😊", None)[0] == "closed"
+    assert _conversation_stage("", "Dios la bendiga", "¡Igualmente! 😊", None)[0] == "closed"
+    assert _conversation_stage(ASK_FEEDBACK, "no gracias", "¿Qué faltó?", None)[0] == "open"
+
+
+def test_customer_name_is_used_only_when_it_reads_as_a_name():
+    from main import _clean_customer_name
+    assert _clean_customer_name("salvadoorvalenzuela") is None
+    assert _clean_customer_name("user_123") is None
+    assert _clean_customer_name("🌸✨") is None
+    assert _clean_customer_name(None) is None
+    assert _clean_customer_name("maría lópez") == "María López"
+    assert _clean_customer_name("Ana 🌸") == "Ana"
+    assert _clean_customer_name("Gilberto Montaño") == "Gilberto Montaño"
+
+
+def _route_with_reply(monkeypatch, replies, **overrides):
+    """The route with a fake model that answers `replies` in order."""
+    import asyncio
+    import main
+    from google.genai.types import Content, Part
+    from google.adk.events import Event
+
+    seen = {"messages": []}
+
+    async def fake_run_async(*, user_id, session_id, new_message):
+        seen["messages"].append(new_message.parts[0].text)
+        text = replies.pop(0)
+        yield Event(author="whatsapp_reservations_agent",
+                    content=Content(role="model", parts=[Part(text=text)]))
+
+    async def fake_topic(message, previous_reply):
+        return None
+
+    monkeypatch.setattr(main._whatsapp_reservations_runner, "run_async", fake_run_async)
+    monkeypatch.setattr(main, "_classify_whatsapp_topic", fake_topic)
+
+    def send(message, **more):
+        req = main.WhatsAppReservationsRequest(
+            **{"companyId": 1, "phone": "+520000007007", "message": message, **overrides, **more})
+        return asyncio.run(main.support_whatsapp_reservations(req))
+    return main, seen, send
+
+
+def test_goodbye_drops_closing_questions_and_ok_after_it_is_silent(monkeypatch):
+    main, seen, send = _route_with_reply(monkeypatch, [
+        "¡Que Dios le bendiga también! Que tenga buena noche.\n\n¿Hay algo más en lo que te pueda ayudar?\n1. Sí\n2. No",
+        "¡Claro! Abrimos a las 10."])
+    resp = send("Gracias Dios la bendiga, buenas noches")
+    assert "¿Hay algo más" not in resp.reply and "1. Sí" not in resp.reply
+    assert resp.conversationStage == "closed"
+    resp = send("ok")
+    assert resp.reply == "" and resp.conversationStage == "closed"
+    assert len(seen["messages"]) == 1             # the model wasn't even called
+    resp = send("ok, ¿a qué hora abren mañana?")  # a new question reopens the chat
+    assert resp.reply == "¡Claro! Abrimos a las 10." and resp.conversationStage == "open"
+    main._CLOSED_WHATSAPP_CHATS.clear()
+
+
+def test_route_cleans_the_customer_name(monkeypatch):
+    main, seen, send = _route_with_reply(monkeypatch, ["¡Hola!"], phone="+520000007008")
+    send("hola", customerName="salvadoorvalenzuela")
+    assert '"customerName": null' in seen["messages"][0]
+
+
+def test_goodbye_drops_a_promotion_sentence():
+    from main import _goodbye_only
+    reply = ('¡Buenas noches! Que descanse. Le recordamos que tenemos la "Promoción 2x1" con el código *2X1* '
+             'por si nos visita pronto.')
+    assert _goodbye_only(reply) == "¡Buenas noches! Que descanse."
+    assert _goodbye_only("Aprovecha el descuento.") == "¡Con gusto! Que estés muy bien. 😊"
+    assert _goodbye_only("¡Hasta mañana, aquí le esperamos!") == "¡Hasta mañana, aquí le esperamos!"
+
+
+# ── Ana's chat (2026-11-07): typos, hearts, reactions ──
+
+def test_typos_and_stretched_thanks_are_goodbyes():
+    from main import _is_farewell
+    for message in ("Grciaa", "Ok graciaas", "Si graciaa", "A ok muchas gracias esta bien", "Asi esta bien"):
+        assert _is_farewell(message), message
+
+
+def test_hearts_and_reactions_are_acknowledgments():
+    from main import _is_ack, _is_reaction
+    for message in ("❤️", "😊🙏", "[reaction]"):
+        assert _is_reaction(message) and _is_ack(message), message
+    assert not _is_reaction("¿?")
+    assert not _is_reaction("ok")
+
+
+def test_a_reaction_is_never_answered_even_mid_chat(monkeypatch):
+    main, seen, send = _route_with_reply(monkeypatch, ["no debería llamarse"], phone="+520000007009")
+    resp = send("[reaction]")
+    assert resp.reply == "" and seen["messages"] == []
+    resp = send("❤️")
+    assert resp.reply == "" and seen["messages"] == []
+
+
+
+def test_dangling_lead_in_is_dropped():
+    from main import _drop_dangling, _fix_closing_options, _goodbye_only
+    assert _drop_dangling("De nada, Ana. Mientras esperas,") == "De nada, Ana."
+    assert _drop_dangling("Hola, Ana.") == "Hola, Ana."
+    fixed = _fix_closing_options("Ya le pedí al equipo.\n\nMientras esperas,\n\n¿Hay algo más en lo que te pueda ayudar?\n1. Sí\n2. No")
+    assert "Mientras esperas" not in fixed and fixed.endswith("1. Sí\n2. No")
+    assert _goodbye_only("De nada, Ana. Mientras esperas, ¿Hay algo más en lo que te pueda ayudar?") == "De nada, Ana."
+
+
+def test_handoff_reply_asks_nothing_more_and_later_promotions_are_dropped(monkeypatch):
+    import main
+    reply_handoff = "Ya le pedí al equipo que te avise por aquí.\n\n¿Hay algo más en lo que te pueda ayudar?\n1. Sí\n2. No"
+    _, seen, send = _route_with_reply(monkeypatch, [
+        reply_handoff, "¡Que tengas buen día! Recuerda que tenemos una promoción 2x1 con el código 2X1.",
+        "Tenemos la promoción 2x1 con el código *2X1*."], phone="+520000007010")
+
+    def run_with_handoff(*, user_id, session_id, new_message):
+        async def gen():
+            from google.adk.events import Event, EventActions
+            from google.genai.types import Content, Part
+            seen["messages"].append(new_message.parts[0].text)
+            yield Event(author="whatsapp_reservations_agent", actions=EventActions(state_delta={
+                "pending_action": {"capability": "REQUEST_HUMAN", "fields": {"reason": "avisar"},
+                                   "confirmationSummary": "avisar"}}),
+                content=Content(role="model", parts=[Part(text=reply_handoff)]))
+        return gen()
+
+    real = main._whatsapp_reservations_runner.run_async
+    monkeypatch.setattr(main._whatsapp_reservations_runner, "run_async", run_with_handoff)
+    resp = send("avísame cuando salga la cobija")
+    assert resp.conversationStage == "handoff" and "¿Hay algo más" not in resp.reply
+    monkeypatch.setattr(main._whatsapp_reservations_runner, "run_async", real)
+    resp = send("No")
+    assert "2x1" not in resp.reply.lower() and "promoción" not in resp.reply.lower()
+    resp = send("¿y qué promociones tienen?")
+    assert "2X1" in resp.reply                      # asked: allowed
+    main._CLOSED_WHATSAPP_CHATS.clear(); main._HANDOFF_WHATSAPP_CHATS.clear()
+
+
+def test_a_promised_person_becomes_a_real_handoff(monkeypatch):
+    import main
+    _, seen, send = _route_with_reply(monkeypatch, [
+        "Una disculpa, Ana. Permíteme pasar tu mensaje a alguien del equipo. Te responderán por aquí mismo muy pronto.\n\n"
+        "Mientras tanto, ¿hay algo más en lo que pueda ayudarte?",
+        "El equipo ya está al tanto.\n\nMientras esperas, ¿hay algo más en lo que pueda ayudarte?"], phone="+520000007011")
+    resp = send("Hoy no abriran")
+    assert resp.pendingAction is not None and resp.pendingAction.capability == "REQUEST_HUMAN"
+    assert "Hoy no abriran" in resp.pendingAction.fields["reason"]
+    assert resp.conversationStage == "handoff"
+    assert "algo más" not in resp.reply and not resp.reply.rstrip().endswith(",")
+    resp = send("Aqui estoy en lavanderia esta cerrado")        # already handed off: no second push
+    assert resp.pendingAction is None and resp.reply == "El equipo ya está al tanto."
+    main._CLOSED_WHATSAPP_CHATS.clear(); main._HANDOFF_WHATSAPP_CHATS.clear()
+
+
+def test_an_offer_of_a_person_is_not_a_promise():
+    from main import _promises_a_person
+    assert not _promises_a_person("Si gustas, ¿quieres que te pase con alguien del equipo?")
+    assert not _promises_a_person("Abrimos a las 10.")
+    assert _promises_a_person("Ya le pedí al equipo que te avise por aquí.")
+    assert _promises_a_person("Alguien de nuestro equipo se pondrá en contacto contigo.")
+
+
+def test_promotions_keep_the_first_purchase_condition(monkeypatch):
+    import tools.backend_api as api
+    rows = {"result": [{"promotions": [
+        {"code": "2X1", "name": "Promoción 2x1 (Todos los servicios)", "promoType": "B2G1", "description": None,
+         "startAtUtc": None, "endAtUtc": None, "firstPurchaseOnly": True, "productId": None},
+        {"code": "OTRA", "name": "Otra", "promoType": "B2G1", "description": "x", "startAtUtc": None,
+         "endAtUtc": None, "firstPurchaseOnly": None}]}]}
+    monkeypatch.setattr(api, "_post", lambda path, body: rows)
+    promos = api.get_promotions(1)
+    assert promos[0]["firstPurchaseOnly"] is True
+    assert promos[1]["firstPurchaseOnly"] is False
+
+
+def test_goodbye_drops_only_new_customer_promotions():
+    from main import _without_new_customer_promo
+    reply = "¡Hasta pronto, Ana! Recuerda que tenemos una promoción 2x1 en todos los servicios, solo para tu primera compra. ¡Te esperamos!"
+    assert _without_new_customer_promo(reply) == "¡Hasta pronto, Ana! ¡Te esperamos!"
+    other = "¡Hasta pronto! Recuerda la promoción VERANO con el código *VERANO*."
+    assert _without_new_customer_promo(other) == other
