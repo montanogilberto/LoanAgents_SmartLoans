@@ -8,8 +8,10 @@ other end, and checks each call against what it should have produced.
     silence between turns, like a phone line).
   * The "customer" is gemini-2.5-flash playing a persona; its lines are spoken
     with macOS `say` (Paulina, es-MX), so the agent hears real audio.
-  * Business data comes from fixtures (FULL: delivers, payment methods
-    registered; BARE: neither), not production, so results are repeatable.
+  * Business info comes from fixtures (FULL: delivers, payment methods
+    registered; BARE: neither) so results are repeatable. Opening hours are
+    the company's real ones (--company-id), read once from the backend
+    (sp_reservationHours) through the same fetch the live bridge uses.
   * Waits for the agent's audio to finish "playing" before answering (except
     the barge-in case), echoes marks like Twilio, and measures latency = end of
     customer speech → first agent audio.
@@ -62,11 +64,10 @@ FRAME = 160            # 20 ms of μ-law at 8 kHz
 SILENCE = b"\xff" * FRAME
 NOT_REG = "NO REGISTRADO — el negocio no lo ha cargado; no lo inventes ni lo menciones como dato"
 
-# Same weekly hours as company 1 (Lavandería): Mon–Fri 10–22, Sat 10–17, Sun 10–14.
-HOURS = {"lunes": ("10:00", "22:00"), "martes": ("10:00", "22:00"), "miércoles": ("10:00", "22:00"),
-         "jueves": ("10:00", "22:00"), "viernes": ("10:00", "22:00"), "sábado": ("10:00", "17:00"),
-         "domingo": ("10:00", "14:00")}
-OPENING = [{"weekday": d, "open": o, "close": c} for d, (o, c) in HOURS.items()]
+# The live bridge's fetch, kept before one_call swaps in the fixture.
+_FETCH_BUSINESS_FACTS = twilio_bridge.fetch_business_facts
+# Filled by load_opening_hours() from the backend: [{"weekday", "open", "close"} | {"weekday", "closed"}].
+OPENING: list[dict] = []
 FULL = {"business": {"address": "Calle Uno 100, Centro", "mapsUrl": NOT_REG, "phone": NOT_REG,
                      "paymentMethods": "Efectivo y tarjeta de débito o crédito",
                      "servicesInfo": NOT_REG,
@@ -76,6 +77,20 @@ FULL = {"business": {"address": "Calle Uno 100, Centro", "mapsUrl": NOT_REG, "ph
                      "extraInfo": NOT_REG},
         "openingHours": OPENING}
 BARE = {"business": {k: NOT_REG for k in FULL["business"]}, "openingHours": OPENING}
+
+
+async def load_opening_hours(company_id: int) -> None:
+    """The company's registered week, from the backend — never hard-coded here."""
+    facts = await _FETCH_BUSINESS_FACTS(company_id, None)
+    opening = facts.get("openingHours")
+    if not isinstance(opening, list):
+        sys.exit(f"Could not read the opening hours of companyId={company_id} from the backend "
+                 f"(/reservationHours); check SMARTLOANS_BACKEND_URL in .env.")
+    if all(d.get("closed") for d in opening):
+        sys.exit(f"companyId={company_id} has no opening hours registered (reservationHours is empty).")
+    OPENING[:] = opening
+    print("Horario (DB):", ", ".join(f"{d['weekday']} {'cerrado' if d.get('closed') else d['open'] + '–' + d['close']}"
+                                    for d in opening))
 
 # Synthetic client: 1 is the walk-in placeholder, which the bridge refuses to call.
 PAYLOAD = {"companyId": 1, "branchId": None, "clientId": 900001, "orderId": 1,
@@ -110,7 +125,10 @@ def _valid_slot(c: Call, f: dict) -> list[str]:
     weekday = next((d for d, iso in c.days.items() if iso == f.get("date")), None)
     if weekday is None:
         return [f"date {f.get('date')} not in nextDays"]
-    opens, closes = HOURS[weekday]
+    day = next((d for d in OPENING if d.get("weekday") == weekday), None)
+    if not day or day.get("closed"):
+        return [f"date {f.get('date')} is {weekday}, closed"]
+    opens, closes = day["open"], day["close"]
     if not (opens <= f.get("time", "") < closes):
         errs.append(f"time {f.get('time')} outside {weekday} {opens}-{closes}")
     if f.get("date") == c.today and f.get("time", "") <= c.now_time:
@@ -376,6 +394,7 @@ async def one_call(port: int, name: str, verbose: bool = True) -> dict:
             "latencies": [round(x, 2) for x in state["latencies"]],
             "endedBy": call.result.endedBy, "bargeIns": call.result.bargeIns,
             "proposals": call.caps(), "agreement": call.fields(), "tokens": call.result.tokens,
+            "toolTrace": call.result.toolTrace, "repeatedQuestions": call.result.repeatedQuestions,
             "promptVersion": call.result.promptVersion}
 
 
@@ -385,7 +404,11 @@ async def main() -> None:
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--json", help="write every call's summary to this file")
+    ap.add_argument("--company-id", type=int, default=PAYLOAD["companyId"],
+                    help="company whose registered opening hours the calls use")
     args = ap.parse_args()
+    PAYLOAD["companyId"] = args.company_id
+    await load_opening_hours(args.company_id)
     names = list(SCENARIOS) if args.scenario == "all" else args.scenario.split(",")
 
     app = FastAPI()
@@ -402,7 +425,7 @@ async def main() -> None:
             s = await one_call(args.port, name)
             summaries.append(s)
             print("  →", "PASS" if s["pass"] else f"FAIL {s['failures']}",
-                  json.dumps({k: s.get(k) for k in ("seconds", "latencies", "bargeIns", "proposals", "agreement")},
+                  json.dumps({k: s.get(k) for k in ("seconds", "latencies", "bargeIns", "proposals", "agreement", "toolTrace")},
                              ensure_ascii=False))
             if args.json:
                 Path(args.json).write_text(json.dumps(summaries, ensure_ascii=False, indent=1))

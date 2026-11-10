@@ -18,6 +18,7 @@ class _Call:
     customer: list[tuple[float, str]] = field(default_factory=list)   # (monotonic time, text)
     proposed_at: float | None = None
     asked_anything_else: bool = False     # end_call has already held the call once
+    agent_turn_ended_at: float | None = None   # when the agent last finished a turn
 
 
 _CALLS: dict[str, _Call] = {}
@@ -44,6 +45,25 @@ def add_customer_text(session_id: str, text: str, at: float | None = None) -> No
 def customer_text_since(session_id: str, since: float) -> str:
     call = _CALLS.get(session_id)
     return "".join(t for at, t in call.customer if at >= since).strip() if call else ""
+
+
+def mark_agent_turn_end(session_id: str, at: float | None = None) -> None:
+    call = _CALLS.get(session_id)
+    if call is not None:
+        call.agent_turn_ended_at = at if at is not None else time.monotonic()
+
+
+def customer_reply(session_id: str, fallback_window_s: float) -> str:
+    """Everything the customer said since the agent last finished speaking —
+    their whole answer to its last question. A fixed window cut off the start
+    of a long reply ("Hola, sí, soy Ana… [6 s more]") and rejected a real yes."""
+    call = _CALLS.get(session_id)
+    if call is None:
+        return ""
+    since = call.agent_turn_ended_at
+    if since is None:
+        since = time.monotonic() - fallback_window_s
+    return customer_text_since(session_id, since)
 
 
 def mark_proposal(session_id: str, at: float | None = None) -> None:

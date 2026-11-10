@@ -97,6 +97,7 @@ class CallResult:
     agentTurns: int = 0
     bargeIns: int = 0
     repeatedQuestions: int = 0
+    toolTrace: list[dict] = field(default_factory=list)   # tool name + ok/error, no arguments
     lineLevel: dict = field(default_factory=dict)
     identityConfirmed: bool = False
     tokens: dict = field(default_factory=dict)
@@ -432,10 +433,20 @@ class TwilioCall:
                         self.muted = True
                         hangup_task = asyncio.create_task(self._hang_up_after_goodbye())
 
+                for call in (event.get_function_calls() or []) if hasattr(event, "get_function_calls") else []:
+                    self.result.toolTrace.append({"tool": call.name})
+                for resp in (event.get_function_responses() or []) if hasattr(event, "get_function_responses") else []:
+                    out = resp.response or {}
+                    # Outcome only (ok / error text) — never the arguments, which hold PII.
+                    self.result.toolTrace.append({"tool": resp.name, "result": "error" if out.get("errors") or out.get("error")
+                                                  else "ok", **({"errors": out.get("errors") or [out.get("error")]}
+                                                                 if out.get("errors") or out.get("error") else {})})
+
                 if event.turn_complete:
                     self._flush_turn("customer")
                     self._flush_turn("agent")
                     self.result.agentTurns += 1
+                    live_state.mark_agent_turn_end(self._session_id)
                     self._agent_talking = False
                     self._last_activity = time.monotonic()
                     if self.ending and hangup_task is None:   # end_call came before the goodbye

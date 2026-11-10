@@ -719,3 +719,29 @@ def test_results_are_not_posted_until_enabled(monkeypatch):
     monkeypatch.setattr(twilio_bridge.httpx, "AsyncClient", lambda **k: called.append(k))
     asyncio.run(twilio_bridge._post_result(twilio_bridge.CallResult(callSid="CA", companyId=1, clientId=2, orderId=3)))
     assert called == []
+
+
+
+def test_identity_reads_the_whole_reply_since_the_agents_question(live_call):
+    """A long reply's "sí, soy Ana" came >8 s before the tool call and was missed."""
+    from agents.voice_secretary.agent import confirm_customer_identity
+    t0 = time.monotonic()
+    live_call.mark_agent_turn_end("S1", at=t0 - 20)
+    live_call.add_customer_text("S1", "Hola, sí, soy Ana. ", at=t0 - 12)        # older than 8 s
+    live_call.add_customer_text("S1", "¿Podría pasar el martes a las cinco?", at=t0 - 1)
+    ctx = _live_ctx("S1", {"voice_order": {"service": "x"}, "voice_customer_name": "Ana"})
+    assert asyncio.run(confirm_customer_identity("sí", ctx))["confirmed"] is True
+
+
+def test_tool_trace_keeps_outcomes_not_arguments():
+    call_ev = SimpleNamespace(**_ev().__dict__)
+    call_ev.get_function_calls = lambda: [SimpleNamespace(name="propose_action", args={"fields": {"address": "Calle 1"}})]
+    resp_ev = SimpleNamespace(**_ev().__dict__)
+    resp_ev.get_function_responses = lambda: [SimpleNamespace(name="propose_action",
+                                                              response={"proposed": False, "errors": ["weekday is required"]})]
+    events = [call_ev, resp_ev, _ev(actions=SimpleNamespace(state_delta={"voice_end_call": True})), _ev(turn_complete=True)]
+    call = twilio_bridge.TwilioCall(FakeWS([]), PAYLOAD, stream_sid="MZ1", call_sid="CA10", runner=FakeRunner(events))
+    result = asyncio.run(asyncio.wait_for(call.run(), 5))
+    assert result.toolTrace[:2] == [{"tool": "propose_action"},
+                                    {"tool": "propose_action", "result": "error", "errors": ["weekday is required"]}]
+    assert "Calle" not in json.dumps(result.toolTrace)
