@@ -83,7 +83,7 @@ async def confirm_customer_identity(what_they_said: str, tool_context: ToolConte
         # On a live call the evidence is what the bridge heard, not the model's account.
         heard, deadline = "", time.monotonic() + _TRANSCRIPT_WAIT_S
         while True:
-            heard = live_state.customer_text_since(session_id, time.monotonic() - IDENTITY_WINDOW_S)
+            heard = live_state.customer_reply(session_id, IDENTITY_WINDOW_S)
             if _NOT_SPEECH.sub("", heard).strip() or time.monotonic() >= deadline:
                 break
             await asyncio.sleep(0.2)
