@@ -76,9 +76,9 @@ def test_reservations_route_returns_topic(monkeypatch):
         yield _final("¡Hola! Abrimos de 8 a 8.")
 
     async def fake_topic(message, previous_reply):
-        return "horarios"
+        return {"topic": "horarios", "outcome": None}
     monkeypatch.setattr(main._whatsapp_reservations_runner, "run_async", run_async)
-    monkeypatch.setattr(main, "_classify_whatsapp_topic", fake_topic)
+    monkeypatch.setattr(main, "_classify_whatsapp_message", fake_topic)
     req = main.WhatsAppReservationsRequest(companyId=1, phone="+520000000077", message="a qué hora abren")
     resp = asyncio.run(main.support_whatsapp_reservations(req))
     assert resp.topic == "horarios" and resp.reply
@@ -112,3 +112,14 @@ def test_insights_parses_and_bounds_output(monkeypatch):
     assert resp.unmetNeeds == ["tintorería"]
     assert resp.messagesAnalyzed == 2
     assert "x" * 301 not in seen["payload"]
+
+
+def test_classify_message_returns_topic_and_outcome(monkeypatch):
+    import main
+    _fake_runner(monkeypatch, main._whatsapp_topic_runner, '{"topic": "confirmacion", "outcome": "implicit_positive"}')
+    assert asyncio.run(main._classify_whatsapp_message("en un rato paso", "Hoy cerramos a las 10 PM.")) == {
+        "topic": "confirmacion", "outcome": "implicit_positive"}
+    _fake_runner(monkeypatch, main._whatsapp_topic_runner, '{"topic": "horarios", "outcome": "none"}')
+    assert asyncio.run(main._classify_whatsapp_message("y mañana?", None))["outcome"] is None
+    _fake_runner(monkeypatch, main._whatsapp_topic_runner, '{"topic": "horarios", "outcome": "great"}')
+    assert asyncio.run(main._classify_whatsapp_message("x", None))["outcome"] is None

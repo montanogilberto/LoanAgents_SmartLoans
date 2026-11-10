@@ -74,10 +74,10 @@ def _call_route(monkeypatch, **overrides):
         yield  # async generator with no events
 
     async def fake_topic(message, previous_reply):
-        return None
+        return {"topic": None, "outcome": None}
 
     monkeypatch.setattr(main._whatsapp_reservations_runner, "run_async", fake_run_async)
-    monkeypatch.setattr(main, "_classify_whatsapp_topic", fake_topic)
+    monkeypatch.setattr(main, "_classify_whatsapp_message", fake_topic)
     req = main.WhatsAppReservationsRequest(
         **{"companyId": 1, "phone": "+526621234567", "message": "hola", **overrides})
     resp = asyncio.run(main.support_whatsapp_reservations(req))
@@ -316,8 +316,8 @@ def test_reservations_route_reports_stage(monkeypatch):
     monkeypatch.setattr(main._whatsapp_reservations_runner, "run_async", run_async)
 
     async def no_topic(*_):
-        return None
-    monkeypatch.setattr(main, "_classify_whatsapp_topic", no_topic)
+        return {"topic": None, "outcome": None}
+    monkeypatch.setattr(main, "_classify_whatsapp_message", no_topic)
     data = TestClient(main.app).post("/support/whatsapp-reservations", json={
         "companyId": 1, "phone": "5266200099999", "message": "a qué hora abren"}).json()
     assert data["conversationStage"] == "feedback_asked" and data["feedback"] is None
@@ -389,8 +389,8 @@ def test_failed_tool_turn_is_error_without_closing_question(monkeypatch):
     monkeypatch.setattr(main._whatsapp_reservations_runner, "run_async", run_async)
 
     async def no_topic(*_):
-        return None
-    monkeypatch.setattr(main, "_classify_whatsapp_topic", no_topic)
+        return {"topic": None, "outcome": None}
+    monkeypatch.setattr(main, "_classify_whatsapp_message", no_topic)
     data = TestClient(main.app).post("/support/whatsapp-reservations", json={
         "companyId": 1, "phone": "5266200099998", "message": "cita"}).json()
     assert data["conversationStage"] == "error"
@@ -502,10 +502,10 @@ def _route_with_reply(monkeypatch, replies, **overrides):
                     content=Content(role="model", parts=[Part(text=text)]))
 
     async def fake_topic(message, previous_reply):
-        return None
+        return {"topic": None, "outcome": None}
 
     monkeypatch.setattr(main._whatsapp_reservations_runner, "run_async", fake_run_async)
-    monkeypatch.setattr(main, "_classify_whatsapp_topic", fake_topic)
+    monkeypatch.setattr(main, "_classify_whatsapp_message", fake_topic)
 
     def send(message, **more):
         req = main.WhatsAppReservationsRequest(
@@ -651,3 +651,51 @@ def test_goodbye_drops_only_new_customer_promotions():
     assert _without_new_customer_promo(reply) == "¡Hasta pronto, Ana! ¡Te esperamos!"
     other = "¡Hasta pronto! Recuerda la promoción VERANO con el código *VERANO*."
     assert _without_new_customer_promo(other) == other
+
+
+def test_message_outcome_explicit_and_escalated_are_decided_in_code():
+    from main import _message_outcome
+    assert _message_outcome(ASK_FEEDBACK, "1", None, None) == "explicit_positive"
+    assert _message_outcome(ASK_FEEDBACK, "no", None, "implicit_positive") == "explicit_negative"
+    assert _message_outcome("", "quiero hablar con alguien", "REQUEST_HUMAN", None) == "escalated"
+    # politeness is not success: courtesy words alone never make it positive
+    assert _message_outcome("Hoy cerramos a las 10:00 PM.", "gracias", None, None) is None
+    assert _message_outcome("No tengo la dirección a la mano.", "gracias, bye", None, None) is None
+    # what code can't read comes from the classifier; a new question has none
+    assert _message_outcome("Hoy cerramos a las 10:00 PM.", "a muy bien en un rato paso", None,
+                            "implicit_positive") == "implicit_positive"
+    assert _message_outcome("Hoy cerramos a las 10:00 PM.", "y mañana?", None, None) is None
+
+
+def test_new_question_after_more_question_is_not_closed():
+    from main import _conversation_stage
+    assert _conversation_stage(ASK_MORE, "y mañana?", "Mañana cerramos a las 10 PM.", None) == ("open", None)
+
+
+def test_goodbye_cuts_at_the_promotion():
+    from main import _goodbye_only
+    assert _goodbye_only("¡De nada, Joselin! Que tengas una excelente tarde.\n\nRecuerda nuestra promoción 2x1."
+                         "\n\n ¡No dudes en preguntar por ellas!") == "¡De nada, Joselin! Que tengas una excelente tarde."
+
+
+def test_more_question_only_after_a_yes_to_feedback(monkeypatch):
+    main, _, send = _route_with_reply(monkeypatch, [
+        "Hoy cerramos a las 10:00 PM.\n\n¿Hay algo más en lo que te pueda ayudar?\n1. Sí\n2. No"])
+    assert send("a qué hora cierran hoy").reply == "Hoy cerramos a las 10:00 PM."
+
+
+def test_yes_to_feedback_keeps_the_more_question_even_if_classified_positive(monkeypatch):
+    main, _, send = _route_with_reply(monkeypatch, [
+        "Estamos en Blvd. Kino 123.\n\n¿Te funcionó la respuesta?\n1. Sí\n2. No",
+        "¿Hay algo más en lo que te pueda ayudar?\n1. Sí\n2. No"])
+
+    async def positive(message, previous_reply):
+        return {"topic": "confirmacion", "outcome": "implicit_positive"}
+    monkeypatch.setattr(main, "_classify_whatsapp_message", positive)
+    send("dónde están")
+    # the fake model doesn't write output_key; real ADK stores the reply there
+    uid = "wa-reservations-1-0-+520000007007"
+    stored = main._session_service.sessions["loan_agents_whatsapp_reservations"][uid][uid]
+    stored.state["whatsapp_reservations_reply"] = "Estamos en Blvd. Kino 123.\n\n" + ASK_FEEDBACK.split("\n\n")[1]
+    resp = send("1")
+    assert resp.reply == ASK_MORE and resp.outcome == "explicit_positive"

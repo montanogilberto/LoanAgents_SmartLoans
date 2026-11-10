@@ -37,7 +37,7 @@ from agents import (
     product_web_lookup_agent, whatsapp_topic_agent, whatsapp_insights_agent,
 )
 from agents.support import support_agent
-from agents.whatsapp_topic.prompt import TOPICS as WHATSAPP_TOPICS
+from agents.whatsapp_topic.prompt import OUTCOMES as WHATSAPP_OUTCOMES, TOPICS as WHATSAPP_TOPICS
 from agents.transfer_extraction.reconcile import review_extraction
 from agents.ticket_extraction.matching import MATCHED, UNAVAILABLE, match_product, match_supplier, parse_pack
 from agents.ticket_extraction.proposal import build_proposal, evaluate
@@ -1710,6 +1710,16 @@ class WhatsAppReservationsResponse(BaseModel):
     # The customer's answer to "¿Te funcionó la respuesta?" ("yes"/"no"),
     # only on the turn that answers it.
     feedback: str | None = None
+    # How the customer took the previous reply, for the dashboard: what they
+    # said or did, not whether a feedback question was shown.
+    #   explicit_positive / explicit_negative: answered "¿Te funcionó?" (1/2)
+    #   implicit_positive: shows the previous ANSWER served — says what they'll
+    #   do ("en un rato paso") or that they understood. A bare "gracias" or a
+    #   goodbye is politeness: None. Also "no me sirve" → explicit_negative
+    #   escalated: handed to a person this turn
+    # None while the conversation just continues. A chat whose last outcome
+    # is None (they stopped answering) is unresolved — never a success.
+    outcome: str | None = None
 
 
 _FEEDBACK_QUESTION = "te funcionó la respuesta"
@@ -1774,7 +1784,7 @@ def _conversation_stage(prev_reply: str, message: str, reply: str,
     # or declined more help, and the reply asks nothing.
     if "?" not in low and _closes_chat(prev_reply, message):
         return "closed", feedback
-    if "?" not in low and "?" in prev and (_MORE_QUESTION in prev or _answer_kind(message) == "no"):
+    if "?" not in low and "?" in prev and _answer_kind(message) == "no" and _FEEDBACK_QUESTION not in prev:
         return "closed", feedback
     return "open", feedback
 
@@ -1860,6 +1870,19 @@ def _closes_chat(prev_reply: str, message: str) -> bool:
     return True
 
 
+def _message_outcome(prev_reply: str, message: str, capability: str | None,
+                     classified: str | None) -> str | None:
+    """Explicit answers and hand-offs are decided here. Whether a message shows
+    the previous answer served ("en un rato paso") is the classifier's call,
+    made against that answer: a bare "gracias" or goodbye is politeness, not
+    success, so code never infers implicit_positive from courtesy words."""
+    if capability == "REQUEST_HUMAN":
+        return "escalated"
+    if _FEEDBACK_QUESTION in (prev_reply or "").lower() and _answer_kind(message):
+        return "explicit_positive" if _answer_kind(message) == "yes" else "explicit_negative"
+    return classified
+
+
 # Chats whose last reply was a goodbye: a later bare "ok" gets no answer at all
 # (the backend sends nothing for an empty reply). In process, like the sessions.
 _CLOSED_WHATSAPP_CHATS: set[str] = set()
@@ -1889,7 +1912,11 @@ def _goodbye_only(reply: str) -> str:
     """A goodbye reply without the closing questions or a promotion (Gemini
     still added "Le recordamos la promoción…" to 1 goodbye in 20, 2026-11-07)."""
     text = _CLOSING_RE.sub("", _OPTIONS_RE.sub("", reply))
-    text = _drop_dangling(re.sub(r"[ \t]{2,}", " ", _PROMO_SENTENCE.sub("", text)).strip())
+    # Cut at the promotion, not just its sentence: what follows refers to it
+    # ("¡No dudes en preguntar por ellas!", 2 of 3 live runs, 2026-11-09).
+    promo = _PROMO_SENTENCE.search(text)
+    text = text[:promo.start()] if promo else text
+    text = _drop_dangling(re.sub(r"[ \t]{2,}", " ", text).strip())
     return text or _GOODBYE_FALLBACK
 
 
@@ -1947,7 +1974,9 @@ async def _run_one_shot_json(runner, app_name: str, output_key: str, payload: di
         await _session_service.delete_session(app_name=app_name, user_id=user_id, session_id=session.id)
 
 
-async def _classify_whatsapp_topic(message: str, previous_reply: str | None) -> str | None:
+async def _classify_whatsapp_message(message: str, previous_reply: str | None) -> dict:
+    """{"topic", "outcome"} for one customer message, each None when the
+    classifier failed, timed out or answered something off the list."""
     try:
         result = await asyncio.wait_for(
             _run_one_shot_json(_whatsapp_topic_runner, "loan_agents_whatsapp_topic", "whatsapp_topic_result",
@@ -1955,9 +1984,14 @@ async def _classify_whatsapp_topic(message: str, previous_reply: str | None) -> 
             timeout=_WHATSAPP_TOPIC_TIMEOUT_SECONDS)
     except Exception:
         logger.exception("[whatsapp_topic] classification failed")
-        return None
-    topic = result.get("topic")
-    return topic if topic in WHATSAPP_TOPICS else None
+        return {"topic": None, "outcome": None}
+    topic, outcome = result.get("topic"), result.get("outcome")
+    return {"topic": topic if topic in WHATSAPP_TOPICS else None,
+            "outcome": outcome if outcome in WHATSAPP_OUTCOMES and outcome != "none" else None}
+
+
+async def _classify_whatsapp_topic(message: str, previous_reply: str | None) -> str | None:
+    return (await _classify_whatsapp_message(message, previous_reply))["topic"]
 
 
 @app.post("/support/whatsapp-reservations", response_model=WhatsAppReservationsResponse)
@@ -1998,7 +2032,7 @@ async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> Wha
     # Tagged in parallel with the reply, so it adds no latency. The previous
     # reply (still in state before this turn) lets "3" or "sí" be read in context.
     prev_reply = session.state.get("whatsapp_reservations_reply") or ""
-    topic_task = asyncio.create_task(_classify_whatsapp_topic(req.message, prev_reply))
+    classify_task = asyncio.create_task(_classify_whatsapp_message(req.message, prev_reply))
     # Hermosillo is UTC-7 all year — same convention as tools/backend_api.py.
     now_local = datetime.now(timezone.utc) - timedelta(hours=7)
     context = {
@@ -2052,6 +2086,7 @@ async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> Wha
             "Responde ahora al último mensaje del cliente siguiendo tus instrucciones.)"))])
 
     pending_action = PendingAction(**pending_raw) if isinstance(pending_raw, dict) else None
+    classified = await classify_task  # started with the turn; long done by now
     if reply and failed_tools:
         # Nothing was answered: no "¿Te funcionó?" (the customer said "No" to
         # one after a timeout, 2026-11-02), and the dashboard counts it as a failure.
@@ -2078,21 +2113,33 @@ async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> Wha
             reply = _without_promotions(reply) or _GOODBYE_FALLBACK
         if _MORE_QUESTION in prev_reply.lower() and _answer_kind(req.message) == "no":
             reply = _without_new_customer_promo(reply) or _GOODBYE_FALLBACK
-        if _closes_chat(prev_reply, req.message) and not pending_raw:
-            # A goodbye never asks "¿Te funcionó?" / "¿algo más?" back.
+        answers_feedback = _FEEDBACK_QUESTION in prev_reply.lower() and bool(_answer_kind(req.message))
+        if (_closes_chat(prev_reply, req.message) or classified["outcome"] == "implicit_positive") \
+                and not answers_feedback and not pending_raw and "promo" not in req.message.lower():
+            # A goodbye — or "en un rato paso" — never asks "¿Te funcionó?" /
+            # "¿algo más?" back, nor sells (a first-purchase 2x1 to a returning
+            # customer, 1 of 3 live runs, 2026-11-09).
             reply = _goodbye_only(reply)
+        if not (_FEEDBACK_QUESTION in prev_reply.lower() and _answer_kind(req.message) == "yes"):
+            # "¿Hay algo más…?" only follows a "sí" to "¿Te funcionó?": Gemini
+            # added it to 5 of 12 plain answers (2026-11-09).
+            reply = _drop_dangling(_ANY_MORE_QUESTION.sub("", reply).strip()) or reply
         reply = _fix_closing_options(reply)
         stage, feedback = _conversation_stage(prev_reply, req.message, reply,
                                               pending_action.capability if pending_action else None)
     else:
         reply = "Perdón, se me complicó responderte. ¿Me lo puedes escribir de otra forma?"
         stage, feedback = "error", None
+    outcome = None if stage == "error" else _message_outcome(
+        prev_reply, req.message, pending_action.capability if pending_action else None, classified["outcome"])
+    if stage == "open" and outcome in ("explicit_positive", "implicit_positive") and "?" not in reply:
+        stage = "closed"  # "en un rato paso" → "¡Te esperamos!": done, nothing left to ask
     if stage == "closed":
         _CLOSED_WHATSAPP_CHATS.add(user_id)
     else:
         _CLOSED_WHATSAPP_CHATS.discard(user_id)
-    return WhatsAppReservationsResponse(reply=reply, pendingAction=pending_action, topic=await topic_task,
-                                        conversationStage=stage, feedback=feedback)
+    return WhatsAppReservationsResponse(reply=reply, pendingAction=pending_action, topic=classified["topic"],
+                                        conversationStage=stage, feedback=feedback, outcome=outcome)
 
 
 class WhatsAppInsightsTopicCount(BaseModel):
