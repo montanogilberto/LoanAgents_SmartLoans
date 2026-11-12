@@ -72,6 +72,8 @@ class FieldSpec:
             return f"{self.name} must be a number, got {value!r}"
         if self.type is list and not isinstance(value, list):
             return f"{self.name} must be a list, got {value!r}"
+        if self.type is bool and not isinstance(value, bool):
+            return f"{self.name} must be true or false, got {value!r}"
 
         if self.enum is not None and value not in self.enum:
             return f"{self.name} must be one of {self.enum}, got {value!r}"
@@ -124,6 +126,15 @@ CONTRACTS: dict[str, Contract] = {
             FieldSpec("clientType", str, required=True, enum=("borrower", "lender", "both", "lawyer", "pos")),
         ),
     ),
+    "REGISTER_CLIENT": Contract(
+        capability="REGISTER_CLIENT",
+        description="agents/whatsapp_registration — a WhatsApp customer registers themself; "
+                    "the phone and companyId come from the channel, never from the agent",
+        fields=(
+            # Nombre y al menos un apellido.
+            FieldSpec("fullName", str, required=True, pattern=r"\s*\S+(\s+\S+)+\s*"),
+        ),
+    ),
     "CREATE_INCOME": Contract(
         capability="CREATE_INCOME",
         description="agents/pos_income_support — new POS sale/income record",
@@ -160,6 +171,60 @@ CONTRACTS: dict[str, Contract] = {
         capability="SEND_CLIENT_QR",
         description="agents/whatsapp_reservations — the sender's own client QR (CLIENT:<id>:<name>, the one the POS scanner reads); the backend matches the client by the WhatsApp phone and sends the image (no confirmation step)",
         fields=(),
+    ),
+    "RECORD_DEMAND_SIGNAL": Contract(
+        capability="RECORD_DEMAND_SIGNAL",
+        description="agents/whatsapp_reservations — campaign: a person's interest in a service concept "
+                    "and the zone where they'd use it (smartloans_backend dbo.demandSignals). Upserted per "
+                    "(company, phone, concept), so it can be called again as more answers come in. No "
+                    "confirmation step; phone, company and channel come from the WhatsApp channel, never "
+                    "from the agent. Value lists must match the SQL CHECK constraints.",
+        fields=(
+            FieldSpec("concept", str, required=True, enum=("autoservicio_24h", "lockers", "qr_gmo")),
+            # Optional since 2026-11-12: every interested person is stored as soon as
+            # the concept is known (smartloans_backend 2026-11-12_demandSignals_zoneOptional.sql).
+            FieldSpec("preferredZoneText", str, required=False, pattern=r"\s*\S.{0,118}"),
+            FieldSpec("residenceZoneText", str, required=False, pattern=r"\s*\S.{0,118}"),
+            FieldSpec("workZoneText", str, required=False, pattern=r"\s*\S.{0,118}"),
+            FieldSpec("frequency", str, required=False, enum=("semanal", "quincenal", "mensual", "ocasional")),
+            FieldSpec("preferredTime", str, required=False,
+                      enum=("temprano", "dia", "tarde", "noche", "madrugada", "fin_de_semana")),
+            FieldSpec("currentSolution", str, required=False,
+                      enum=("lavadora_propia", "lavanderia", "familiar", "otro")),
+            FieldSpec("painPoint", str, required=False, pattern=r"(?s)\s*\S.{0,198}"),
+            FieldSpec("wouldUse", str, required=False, enum=("si", "tal_vez", "no")),
+            FieldSpec("notifyOptIn", bool, required=False),
+            FieldSpec("prospectName", str, required=False, pattern=r"\s*\S.{0,118}"),
+            # Clean colonia/sector name for the demand map; preferredZoneText keeps their words.
+            FieldSpec("preferredZoneName", str, required=False, pattern=r"\s*\S.{0,118}"),
+        ),
+    ),
+    "RECORD_LOCATION_HOST": Contract(
+        capability="RECORD_LOCATION_HOST",
+        description="agents/whatsapp_reservations — Red GMO: a business offering space for a GMO locker "
+                    "(smartloans_backend dbo.locationHosts). Upserted per (company, phone, businessName), "
+                    "so it can be called again as more answers come in. No confirmation step; phone, "
+                    "company and channel come from the WhatsApp channel, never from the agent. Value lists "
+                    "must match the SQL CHECK constraints.",
+        fields=(
+            FieldSpec("businessName", str, required=True, pattern=r"\s*\S.{0,118}"),
+            FieldSpec("zoneText", str, required=True, pattern=r"\s*\S.{0,118}"),
+            FieldSpec("zoneName", str, required=False, pattern=r"\s*\S.{0,118}"),
+            FieldSpec("businessType", str, required=False,
+                      enum=("tienda", "gimnasio", "farmacia", "oficina", "escuela", "gasolinera",
+                            "restaurante", "otro")),
+            FieldSpec("contactName", str, required=False, pattern=r"\s*\S.{0,118}"),
+            FieldSpec("contactRole", str, required=False, enum=("dueno", "encargado", "otro")),
+            FieldSpec("addressText", str, required=False, pattern=r"\s*\S.{0,198}"),
+            FieldSpec("openingHours", str, required=False, pattern=r"\s*\S.{0,118}"),
+            FieldSpec("opensWeekends", bool, required=False),
+            FieldSpec("spaceType", str, required=False,
+                      enum=("interior", "exterior", "estacionamiento", "no_seguro")),
+            FieldSpec("dailyVisitors", str, required=False,
+                      enum=("menos_50", "50_200", "mas_200", "no_seguro")),
+            FieldSpec("hasParking", bool, required=False),
+            FieldSpec("contactOptIn", bool, required=False),
+        ),
     ),
     "CREATE_RESERVATION": Contract(
         capability="CREATE_RESERVATION",

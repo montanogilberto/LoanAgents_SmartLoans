@@ -64,7 +64,7 @@ def _call_route(monkeypatch, **overrides):
 
     seen = {}
 
-    async def fake_run_async(*, user_id, session_id, new_message):
+    async def fake_run_async(*, user_id, session_id, new_message, **_):
         seen["user_id"] = user_id
         # setdefault: an empty turn is retried with an internal nudge — keep
         # the customer's (first) message.
@@ -308,7 +308,7 @@ def test_reservations_route_reports_stage(monkeypatch):
     import main
     from fastapi.testclient import TestClient
 
-    async def run_async(*, user_id, session_id, new_message):
+    async def run_async(*, user_id, session_id, new_message, **_):
         from types import SimpleNamespace
         from google.genai.types import Content, Part
         yield SimpleNamespace(partial=False, actions=None, is_final_response=lambda: True,
@@ -379,7 +379,7 @@ def test_failed_tool_turn_is_error_without_closing_question(monkeypatch):
     from google.genai.types import Content, FunctionResponse, Part
     from tools.safe_tool import UNAVAILABLE
 
-    async def run_async(*, user_id, session_id, new_message):
+    async def run_async(*, user_id, session_id, new_message, **_):
         yield SimpleNamespace(partial=False, actions=None, is_final_response=lambda: False,
                               content=Content(role="user", parts=[Part(function_response=FunctionResponse(
                                   name="get_reservation_services", response=dict(UNAVAILABLE)))]))
@@ -495,7 +495,7 @@ def _route_with_reply(monkeypatch, replies, **overrides):
 
     seen = {"messages": []}
 
-    async def fake_run_async(*, user_id, session_id, new_message):
+    async def fake_run_async(*, user_id, session_id, new_message, **_):
         seen["messages"].append(new_message.parts[0].text)
         text = replies.pop(0)
         yield Event(author="whatsapp_reservations_agent",
@@ -585,7 +585,7 @@ def test_handoff_reply_asks_nothing_more_and_later_promotions_are_dropped(monkey
         reply_handoff, "¡Que tengas buen día! Recuerda que tenemos una promoción 2x1 con el código 2X1.",
         "Tenemos la promoción 2x1 con el código *2X1*."], phone="+520000007010")
 
-    def run_with_handoff(*, user_id, session_id, new_message):
+    def run_with_handoff(*, user_id, session_id, new_message, **_):
         async def gen():
             from google.adk.events import Event, EventActions
             from google.genai.types import Content, Part
@@ -699,3 +699,135 @@ def test_yes_to_feedback_keeps_the_more_question_even_if_classified_positive(mon
     stored.state["whatsapp_reservations_reply"] = "Estamos en Blvd. Kino 123.\n\n" + ASK_FEEDBACK.split("\n\n")[1]
     resp = send("1")
     assert resp.reply == ASK_MORE and resp.outcome == "explicit_positive"
+
+
+def test_campaign_block_never_promises_availability():
+    from agents.whatsapp_campaign.prompt import CAMPAIGN_INSTRUCTION
+    text = " ".join(CAMPAIGN_INSTRUCTION.split())  # line wrapping must not matter
+    assert "DO NOT EXIST YET" in text
+    assert "never give a date, a price, or a locker location" in text
+    assert "Only an explicit yes counts as permission" in text
+
+
+def test_campaign_block_records_demand_with_backend_value_lists():
+    """The values the prompt teaches must be exactly the contract's enums, which
+    mirror smartloans_backend dbo.demandSignals CHECK constraints."""
+    from agents.whatsapp_campaign.prompt import CAMPAIGN_INSTRUCTION
+    from retrieval.contracts import CONTRACTS
+    assert 'capability="RECORD_DEMAND_SIGNAL"' in CAMPAIGN_INSTRUCTION
+    specs = {f.name: f for f in CONTRACTS["RECORD_DEMAND_SIGNAL"].fields}
+    for name in ("frequency", "preferredTime", "currentSolution", "wouldUse"):
+        for value in specs[name].enum:
+            assert f'"{value}"' in CAMPAIGN_INSTRUCTION, (name, value)
+    assert "never guess a value" in CAMPAIGN_INSTRUCTION
+    assert "don't call\n  any other propose_action" in CAMPAIGN_INSTRUCTION
+
+
+def test_campaign_block_records_location_hosts_without_income_promises():
+    from agents.whatsapp_campaign.prompt import CAMPAIGN_INSTRUCTION
+    from retrieval.contracts import CONTRACTS
+    text = " ".join(CAMPAIGN_INSTRUCTION.split())
+    assert 'capability="RECORD_LOCATION_HOST"' in CAMPAIGN_INSTRUCTION
+    assert "Never promise income" in text and "not a guaranteed income" in text
+    specs = {f.name: f for f in CONTRACTS["RECORD_LOCATION_HOST"].fields}
+    for name in ("businessType", "contactRole", "spaceType", "dailyVisitors"):
+        for value in specs[name].enum:
+            assert f'"{value}"' in CAMPAIGN_INSTRUCTION, (name, value)
+
+
+def test_campaign_treats_ad_leads_and_default_meta_greeting_as_campaign():
+    """Ad clicks often arrive as Meta's default English greeting; the ad's own
+    text (adReferral) must route them to the campaign, not to business info."""
+    from agents.whatsapp_campaign.prompt import CAMPAIGN_INSTRUCTION, INSTRUCTION
+    text = " ".join(CAMPAIGN_INSTRUCTION.split())
+    assert '"adReferral"' in text
+    assert "Can I learn more about your business?" in text
+    assert "Always answer in Spanish" in text
+    assert "Hermosillo only" in text
+    assert '"adReferral"' in INSTRUCTION
+
+
+def test_reservations_request_accepts_ad_referral():
+    from main import WhatsAppReservationsRequest
+    req = WhatsAppReservationsRequest(companyId=1, phone="+5216621234567", message="hola",
+                                      adReferral={"headline": "Lockers GMO", "body": None, "sourceType": "ad"})
+    assert req.adReferral["headline"] == "Lockers GMO"
+    assert WhatsAppReservationsRequest(companyId=1, phone="+52", message="hola").adReferral is None
+
+
+def test_company_agent_has_no_campaign_block_only_the_client_note():
+    """2026-11-12 split: the campaign is its own agent; the company agent keeps
+    the first-contact intro, plus a note for clients of a campaign company."""
+    from agents.whatsapp_campaign.prompt import CAMPAIGN_INSTRUCTION
+    from agents.whatsapp_reservations.prompt import CLIENT_CAMPAIGN_NOTE, FIRST_CONTACT_INTRO, build_instruction
+    for cid in (1, "1", 1008, None, "x"):
+        text = build_instruction(cid)
+        assert "<<FIRST_CONTACT>>" not in text and FIRST_CONTACT_INTRO in text
+        assert CAMPAIGN_INSTRUCTION not in text
+    assert CLIENT_CAMPAIGN_NOTE in build_instruction(1)
+    assert CLIENT_CAMPAIGN_NOTE not in build_instruction(1008)
+
+
+def test_campaign_agent_is_its_own_tree_with_its_own_registration():
+    from agents import whatsapp_campaign_agent, whatsapp_reservations_agent
+    from agents.whatsapp_campaign.prompt import CAMPAIGN_INSTRUCTION
+    assert CAMPAIGN_INSTRUCTION in whatsapp_campaign_agent.instruction
+    assert "NOT a client of the business yet" in whatsapp_campaign_agent.instruction
+    assert "get_my_reward_points" not in {t.name for t in whatsapp_campaign_agent.tools}
+    reg = whatsapp_campaign_agent.sub_agents[0]
+    assert reg is not whatsapp_reservations_agent.sub_agents[0]
+    assert reg.parent_agent is whatsapp_campaign_agent
+    assert 'agent_name="whatsapp_campaign_agent"' in reg.instruction
+    assert whatsapp_campaign_agent.output_key == whatsapp_reservations_agent.output_key
+
+
+def test_route_sends_clients_to_company_and_campaign_leads_to_campaign():
+    from main import _whatsapp_route as route
+    ad = {"headline": "Lockers GMO"}
+    # Clients of the company: always the company agent, even from an ad.
+    for status in ("found", "ambiguous"):
+        assert route(1, status, "Quiero un locker GMO en mi zona", ad, "campaign", True) == "company"
+    # Non-clients writing about the campaign.
+    assert route(1, "not_found", "hola", ad, None, True) == "campaign"
+    assert route(1, "not_found", "Quiero el autoservicio GMO en mi zona", None, None, False) == "campaign"
+    assert route(1, "unavailable", "Can I learn more about your business?", None, None, True) == "campaign"
+    # The default greeting later in a chat is not a campaign signal by itself.
+    assert route(1, "not_found", "¿Me puedes dar más información?", None, None, False) == "company"
+    # A non-client with an everyday question is a normal new customer.
+    assert route(1, "not_found", "quiero reservar un lavado mañana", None, None, True) == "company"
+    # Once in the campaign it stays there, except for company-only things.
+    assert route(1, "not_found", "por la Pitic", None, "campaign", False) == "campaign"
+    assert route(1, "not_found", "mejor quiero apartar una cita", None, "campaign", False) == "company"
+    # A company without the campaign never gets it.
+    assert route(1008, "not_found", "Quiero un locker GMO", ad, None, True) == "company"
+
+
+def test_route_runs_the_chosen_agent_and_reports_it(monkeypatch):
+    import asyncio
+    import main
+    from fastapi.testclient import TestClient
+    from google.genai.types import Content, Part
+    from google.adk.events import Event
+
+    calls = []
+
+    def fake(name):
+        async def run_async(*, user_id, session_id, new_message, state_delta=None, **_):
+            calls.append((name, state_delta))
+            yield Event(author=name, content=Content(role="model", parts=[Part(text="Hola")]))
+        return run_async
+
+    async def classify(message, previous_reply):
+        return {"topic": None, "outcome": None}
+
+    monkeypatch.setattr(main._whatsapp_reservations_runner, "run_async", fake("company"))
+    monkeypatch.setattr(main._whatsapp_campaign_runner, "run_async", fake("campaign"))
+    monkeypatch.setattr(main, "_classify_whatsapp_message", classify)
+    c = TestClient(main.app)
+    body = {"companyId": 1, "phone": "+5216620000001", "message": "Quiero un locker GMO en mi zona"}
+    r = c.post("/support/whatsapp-reservations", json={**body, "client": {"status": "not_found"}}).json()
+    assert r["route"] == "campaign" and calls[-1] == ("campaign", {"wa_route": "campaign", "wa_client_status": "not_found"})
+    body["phone"] = "+5216620000002"
+    r = c.post("/support/whatsapp-reservations", json={**body, "client": {"status": "found", "firstName": "Ana"}}).json()
+    assert r["route"] == "company" and calls[-1][0] == "company"
+
