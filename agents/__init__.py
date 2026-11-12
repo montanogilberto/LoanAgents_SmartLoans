@@ -23,6 +23,8 @@ from agents.pos_expenses_support import pos_expenses_support_agent
 from agents.pos_accounting_support import pos_accounting_support_agent
 from agents.pos_rewards_support import pos_rewards_support_agent
 from agents.whatsapp_reservations import whatsapp_reservations_agent
+from agents.whatsapp_registration import whatsapp_registration_agent
+from agents.whatsapp_campaign import whatsapp_campaign_agent
 from agents.voice_secretary import voice_secretary_agent
 from agents.whatsapp_topic import whatsapp_topic_agent
 from agents.whatsapp_insights import whatsapp_insights_agent
@@ -54,6 +56,8 @@ __all__ = [
     "pos_accounting_support_agent",
     "pos_rewards_support_agent",
     "whatsapp_reservations_agent",
+    "whatsapp_registration_agent",
+    "whatsapp_campaign_agent",
     "voice_secretary_agent",
     "whatsapp_topic_agent",
     "whatsapp_insights_agent",

@@ -876,3 +876,36 @@ def _machine_availability(devices: list[dict], uses: list[dict], branch_id, now:
         "noData": sum(m["state"] == "sin_datos" for m in machines),
         "machines": machines,
     }
+
+
+def get_my_registration(tool_context: ToolContext) -> dict:
+    """Whether the customer writing on WhatsApp is already a registered client
+    of THIS business — ONLY them. Takes no arguments on purpose: the phone is
+    the WhatsApp sender's and the business is the number they wrote to (both
+    set by the system in session state), so it can't be pointed at anyone else.
+
+    Returns:
+        {"status": "found", "firstName"} — already registered here
+        {"status": "not_found"}          — not registered at this business
+        {"status": "ambiguous"}          — several clients share this number
+        {"status": "unavailable"}        — lookup failed (the system re-checks
+                                           before registering anyway)
+    """
+    company_id = tool_context.state.get("wa_company_id")
+    phone = tool_context.state.get("wa_customer_phone")
+    if not company_id or not phone or not WORKER_KEY:
+        return {"status": "unavailable"}
+    try:
+        resp = httpx.post(f"{SMARTLOANS_BACKEND_URL}/whatsapp/assistant/customerRewards",
+                          json={"customerRewards": [{"companyId": company_id, "phone": phone}]},
+                          headers={"X-Worker-Key": WORKER_KEY}, timeout=_TIMEOUT)
+        resp.raise_for_status()
+        rows = resp.json().get("result") or []
+        row = rows[0] if rows else {}
+    except Exception:
+        return {"status": "unavailable"}
+    status = row.get("status")
+    if status == "found":
+        return {"status": "found", "firstName": row.get("firstName")}
+    return {"status": status if status in ("not_found", "ambiguous") else "unavailable"}
+

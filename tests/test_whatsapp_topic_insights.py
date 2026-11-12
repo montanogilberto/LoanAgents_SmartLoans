@@ -12,7 +12,7 @@ def _final(text):
 
 
 def _fake_runner(monkeypatch, runner, text, seen=None):
-    async def run_async(*, user_id, session_id, new_message):
+    async def run_async(*, user_id, session_id, new_message, **_):
         if seen is not None:
             seen["payload"] = new_message.parts[0].text
         yield _final(text)
@@ -72,7 +72,7 @@ def test_one_shot_sessions_are_deleted(monkeypatch):
 def test_reservations_route_returns_topic(monkeypatch):
     import main
 
-    async def run_async(*, user_id, session_id, new_message):
+    async def run_async(*, user_id, session_id, new_message, **_):
         yield _final("¡Hola! Abrimos de 8 a 8.")
 
     async def fake_topic(message, previous_reply):

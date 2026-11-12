@@ -4,7 +4,8 @@ import inspect
 from google.adk.agents import Agent
 from google.adk.tools import FunctionTool
 
-from agents.whatsapp_reservations.prompt import INSTRUCTION
+from agents.whatsapp_registration import whatsapp_registration_agent
+from agents.whatsapp_reservations.prompt import build_instruction
 from tools.backend_api import (
     get_available_slots, get_business_info, get_faqs, get_machine_availability, get_my_reward_points,
     get_promotions, get_reservation_hours, get_reservation_services,
@@ -37,7 +38,8 @@ whatsapp_reservations_agent = Agent(
         "handing off to a person (REQUEST_HUMAN). Answers business facts only from tools."
     ),
     model="gemini-2.5-flash",
-    instruction=lambda _ctx: INSTRUCTION,
+    # The campaign block is added only for the companies running it (prompt.py).
+    instruction=lambda ctx: build_instruction(ctx.state.get("wa_company_id")),
     # Read tools never crash the turn: a backend timeout becomes "unavailable" for the model
     # (tools/safe_tool.py). propose_action reports its own validation errors.
     tools=[
@@ -53,4 +55,7 @@ whatsapp_reservations_agent = Agent(
     ],
     before_tool_callback=_use_trusted_ids,
     output_key="whatsapp_reservations_reply",
+    # Same chat, same session: "quiero registrarme" is handed to it with
+    # transfer_to_agent and it hands back anything else.
+    sub_agents=[whatsapp_registration_agent],
 )

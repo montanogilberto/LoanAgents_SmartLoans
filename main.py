@@ -34,8 +34,9 @@ from agents import (
     ticket_extraction_agent, client_followup_agent, order_triage_agent, pos_clients_support_agent,
     pos_income_support_agent, pos_expenses_support_agent, pos_accounting_support_agent,
     pos_rewards_support_agent, whatsapp_reservations_agent, product_extraction_agent,
-    product_web_lookup_agent, whatsapp_topic_agent, whatsapp_insights_agent,
+    product_web_lookup_agent, whatsapp_topic_agent, whatsapp_insights_agent, whatsapp_campaign_agent,
 )
+from agents.whatsapp_campaign.prompt import runs_campaign
 from agents.support import support_agent
 from agents.whatsapp_topic.prompt import OUTCOMES as WHATSAPP_OUTCOMES, TOPICS as WHATSAPP_TOPICS
 from agents.transfer_extraction.reconcile import review_extraction
@@ -168,6 +169,9 @@ _pos_expenses_support_runner = MeteredRunner(agent=pos_expenses_support_agent, a
 _pos_accounting_support_runner = MeteredRunner(agent=pos_accounting_support_agent, app_name="loan_agents_pos_accounting_support", session_service=_session_service)
 _pos_rewards_support_runner = MeteredRunner(agent=pos_rewards_support_agent, app_name="loan_agents_pos_rewards_support", session_service=_session_service)
 _whatsapp_reservations_runner = MeteredRunner(agent=whatsapp_reservations_agent, app_name="loan_agents_whatsapp_reservations", session_service=_session_service)
+# Same app_name and session as the company agent: the route picks one of the two
+# per message and both read the same chat history.
+_whatsapp_campaign_runner = MeteredRunner(agent=whatsapp_campaign_agent, app_name="loan_agents_whatsapp_reservations", session_service=_session_service)
 _whatsapp_topic_runner = MeteredRunner(agent=whatsapp_topic_agent, app_name="loan_agents_whatsapp_topic", session_service=_session_service)
 _whatsapp_insights_runner = MeteredRunner(agent=whatsapp_insights_agent, app_name="loan_agents_whatsapp_insights", session_service=_session_service)
 
@@ -1693,6 +1697,15 @@ class WhatsAppReservationsRequest(BaseModel):
     message: str
     customerName: str | None = None
     recentReservation: dict | None = None
+    # The Click-to-WhatsApp ad that opened the chat ({headline, body,
+    # sourceType}); only on the first message after the click.
+    adReferral: dict | None = None
+    # A location pin the customer shared in THIS message: {name, address} only —
+    # the backend keeps the coordinates and attaches them itself.
+    sharedLocation: dict | None = None
+    # Whether the sender is a client of this company, checked by the backend by
+    # phone: {"status": found|not_found|ambiguous|unavailable, "firstName"}.
+    client: dict | None = None
 
 
 class WhatsAppReservationsResponse(BaseModel):
@@ -1720,6 +1733,9 @@ class WhatsAppReservationsResponse(BaseModel):
     # None while the conversation just continues. A chat whose last outcome
     # is None (they stopped answering) is unresolved — never a success.
     outcome: str | None = None
+    # Which agent answered: "company" (clients and everyday questions) or
+    # "campaign" (non-clients writing about the campaign). Chosen by the route.
+    route: str = "company"
 
 
 _FEEDBACK_QUESTION = "te funcionó la respuesta"
@@ -1994,6 +2010,33 @@ async def _classify_whatsapp_topic(message: str, previous_reply: str | None) -> 
     return (await _classify_whatsapp_message(message, previous_reply))["topic"]
 
 
+_CLIENT_STATUSES = ("found", "not_found", "ambiguous", "unavailable")
+# The campaign's own words (its ads' greetings included) and Meta's default
+# greeting, which an ad click often arrives as.
+_CAMPAIGN_WORDS = re.compile(
+    r"autoservicio|24\s*h|24 horas|de noche|locker|casiller|red gmo|qr gmo|en mi zona|mi negocio|\bsocio",
+    re.IGNORECASE)
+_DEFAULT_GREETING = re.compile(r"learn more about your business|m[aá]s informaci[oó]n", re.IGNORECASE)
+# Things only the company agent does: a chat in the campaign goes back to it for these.
+_COMPANY_WORDS = re.compile(r"reserv|\bcita\b|apart[ae]r|\bpuntos\b", re.IGNORECASE)
+
+
+def _whatsapp_route(company_id: int, client_status: str, message: str, ad_referral: dict | None,
+                    previous_route: str | None, first_message: bool) -> str:
+    """Which agent answers this message — decided here, never by the model.
+    Clients of the company always get the company agent; the campaign agent is
+    only for non-clients of a company running the campaign who write about it."""
+    if not runs_campaign(company_id) or client_status in ("found", "ambiguous"):
+        return "company"
+    if ad_referral or _CAMPAIGN_WORDS.search(message or ""):
+        return "campaign"
+    if first_message and _DEFAULT_GREETING.search(message or ""):
+        return "campaign"
+    if previous_route == "campaign" and not _COMPANY_WORDS.search(message or ""):
+        return "campaign"
+    return "company"
+
+
 @app.post("/support/whatsapp-reservations", response_model=WhatsAppReservationsResponse)
 async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> WhatsAppReservationsResponse:
     """A business's customers chatting on WhatsApp: shows its service catalog
@@ -2049,6 +2092,17 @@ async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> Wha
         ],
         "recentReservation": req.recentReservation,
     }
+    if req.adReferral:
+        context["adReferral"] = req.adReferral
+    if req.sharedLocation:
+        context["sharedLocation"] = req.sharedLocation
+    client = req.client if isinstance(req.client, dict) else {}
+    client_status = client.get("status") if client.get("status") in _CLIENT_STATUSES else "unavailable"
+    context["client"] = {"status": client_status,
+                         "firstName": client.get("firstName") if client_status == "found" else None}
+    route = _whatsapp_route(req.companyId, client_status, req.message, req.adReferral,
+                            session.state.get("wa_route"), first_message=not session.events)
+    runner = _whatsapp_campaign_runner if route == "campaign" else _whatsapp_reservations_runner
     message = Content(role="user", parts=[Part(text=f"{req.message}\n\nContext: {json.dumps(context, ensure_ascii=False)}")])
 
     # The reply is read from THIS turn's final events, never from
@@ -2064,7 +2118,8 @@ async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> Wha
     failed_tools = set()  # read tools that answered "unavailable" (tools/safe_tool.py) and weren't retried OK
     for attempt in range(2):
         texts = []
-        async for event in _whatsapp_reservations_runner.run_async(user_id=user_id, session_id=session.id, new_message=message):
+        async for event in runner.run_async(user_id=user_id, session_id=session.id, new_message=message,
+                                            state_delta={"wa_route": route, "wa_client_status": client_status}):
             delta = event.actions.state_delta if event.actions else {}
             if "pending_action" in delta:
                 pending_raw = delta["pending_action"]
@@ -2139,7 +2194,8 @@ async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> Wha
     else:
         _CLOSED_WHATSAPP_CHATS.discard(user_id)
     return WhatsAppReservationsResponse(reply=reply, pendingAction=pending_action, topic=classified["topic"],
-                                        conversationStage=stage, feedback=feedback, outcome=outcome)
+                                        conversationStage=stage, feedback=feedback, outcome=outcome,
+                                        route=route)
 
 
 class WhatsAppInsightsTopicCount(BaseModel):
