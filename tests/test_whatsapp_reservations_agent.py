@@ -831,3 +831,24 @@ def test_route_runs_the_chosen_agent_and_reports_it(monkeypatch):
     r = c.post("/support/whatsapp-reservations", json={**body, "client": {"status": "found", "firstName": "Ana"}}).json()
     assert r["route"] == "company" and calls[-1][0] == "company"
 
+
+
+def test_team_messages_reach_both_agents_context():
+    """2026-11-12, Enrique: the team asked for name/phone/location from the POS
+    and his answer reached the agent with no context."""
+    import main
+    from agents.whatsapp_campaign.prompt import INSTRUCTION as CAMPAIGN
+    from agents.whatsapp_reservations.prompt import INSTRUCTION as COMPANY
+    assert '"staffMessages"' in COMPANY and '"staffMessages"' in CAMPAIGN
+    assert "never the\n    phone" in CAMPAIGN
+    req = main.WhatsAppReservationsRequest(companyId=1, phone="+5216621140790", message="Enrique Vizcaino",
+                                           staffMessages=[{"text": "¿Su nombre?", "atUtc": "2026-11-12T18:51:49"}])
+    assert req.staffMessages[0]["text"] == "¿Su nombre?"
+
+
+def test_campaign_shares_the_campaign_site_not_on_first_greeting():
+    from agents.whatsapp_campaign.prompt import CAMPAIGN_INSTRUCTION
+    text = " ".join(CAMPAIGN_INSTRUCTION.split())
+    assert text.count("https://campaign.gmolavanderia.com/") >= 2  # customers + Red GMO
+    assert "never in the first reply to a default greeting" in text
+    assert "at most once per chat" in text

@@ -1706,6 +1706,10 @@ class WhatsAppReservationsRequest(BaseModel):
     # Whether the sender is a client of this company, checked by the backend by
     # phone: {"status": found|not_found|ambiguous|unavailable, "firstName"}.
     client: dict | None = None
+    # What the team wrote to this customer since the agent's last reply (POS or
+    # WhatsApp Business app, last 24 h): [{"text", "atUtc"}]. The agent never
+    # sees those messages otherwise.
+    staffMessages: list | None = None
 
 
 class WhatsAppReservationsResponse(BaseModel):
@@ -2096,6 +2100,10 @@ async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> Wha
         context["adReferral"] = req.adReferral
     if req.sharedLocation:
         context["sharedLocation"] = req.sharedLocation
+    if req.staffMessages:
+        context["staffMessages"] = [
+            {"text": str(m.get("text"))[:500], "atUtc": m.get("atUtc")}
+            for m in req.staffMessages[-3:] if isinstance(m, dict) and m.get("text")]
     client = req.client if isinstance(req.client, dict) else {}
     client_status = client.get("status") if client.get("status") in _CLIENT_STATUSES else "unavailable"
     context["client"] = {"status": client_status,
