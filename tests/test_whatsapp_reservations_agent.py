@@ -252,10 +252,13 @@ def test_prompt_shares_address_and_maps_link():
     assert "no links." not in INSTRUCTION
 
 
-def test_prompt_delivery_app_pickup_sends_address():
+def test_prompt_delivery_app_pickup_follows_the_business_policy():
+    # A universal "yes" was a GMO rule applied to every business (2026-11-17).
     from agents.whatsapp_reservations.prompt import INSTRUCTION
     assert "DiDi, Uber" in INSTRUCTION
-    assert "El conductor debe bajarse a recoger el\n  producto en la sucursal" in INSTRUCTION
+    assert "answer ONLY\n  from pickupPolicy" in INSTRUCTION
+    assert "don't promise it" in INSTRUCTION
+    assert "say yes, give the" not in INSTRUCTION
 
 
 def test_prompt_closing_flow_ends_with_best_promotion():
@@ -852,3 +855,46 @@ def test_campaign_shares_the_campaign_site_not_on_first_greeting():
     assert text.count("https://campaign.gmolavanderia.com/") >= 2  # customers + Red GMO
     assert "never in the first reply to a default greeting" in text
     assert "at most once per chat" in text
+
+
+def test_closing_thanks_in_an_ended_chat_needs_no_answer():
+    """2026-11-13, Rosa: four thanks after the campaign ended, each one answered."""
+    import main
+    assert main._is_closing_thanks("Gracias y felicidades por pensar que será pronto y comodo")
+    assert main._is_closing_thanks("Graciaas")
+    assert not main._is_closing_thanks("gracias, ¿y cuánto costará?")
+    assert not main._is_closing_thanks("Si perfecto espero con gusto")
+
+
+def test_campaign_thanks_and_receipt_ok_close_the_chat(monkeypatch):
+    import main
+    from fastapi.testclient import TestClient
+    from google.genai.types import Content, Part
+    from google.adk.events import Event
+
+    def fake(text):
+        async def run_async(*, user_id, session_id, new_message, **_):
+            yield Event(author="x", content=Content(role="model", parts=[Part(text=text)]))
+        return run_async
+
+    async def classify(message, previous_reply):
+        return {"topic": None, "outcome": None}
+
+    monkeypatch.setattr(main, "_classify_whatsapp_message", classify)
+    c = TestClient(main.app)
+    # Campaign: a thanks answered without a question closes it; the next thanks gets nothing.
+    monkeypatch.setattr(main._whatsapp_campaign_runner, "run_async", fake("¡Gracias a ti! Te avisamos pronto."))
+    body = {"companyId": 1, "phone": "+5216620007195", "client": {"status": "not_found"}}
+    c.post("/support/whatsapp-reservations", json={**body, "message": "Quiero el autoservicio 24 h"})
+    r = c.post("/support/whatsapp-reservations", json={**body, "message": "Gracias, que sea pronto el autoservicio"}).json()
+    assert r["route"] == "campaign" and r["conversationStage"] == "closed"
+    r = c.post("/support/whatsapp-reservations",
+               json={**body, "message": "Gracias y felicidades por pensar que será pronto"}).json()
+    assert r["reply"] == "" and r["conversationStage"] == "closed"
+    # Company: "Ok" to a receipt → one line, closed.
+    monkeypatch.setattr(main._whatsapp_reservations_runner, "run_async", fake("¡Gracias, Jesús! Que tengas buen día."))
+    r = c.post("/support/whatsapp-reservations", json={
+        "companyId": 1, "phone": "+5216620001401", "message": "Ok", "client": {"status": "found", "firstName": "Jesús"},
+        "staffMessages": [{"text": "Gracias por su compra. Total: $250.00 MXN", "atUtc": "2026-11-14T22:36:00",
+                           "kind": "notification"}]}).json()
+    assert r["conversationStage"] == "closed"

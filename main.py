@@ -1850,6 +1850,18 @@ def _is_ack(message: str) -> bool:
     return bool(words) and len(words) <= 3 and all(w in _ACK_WORDS for w in words)
 
 
+def _has_thanks(message: str) -> bool:
+    words = re.sub(r"[^\w\s]", " ", (message or "").lower()).split()
+    return any(re.sub(r"([a-záéíóúñ])\1+", r"\1", w) in _THANKS for w in words)
+
+
+def _is_closing_thanks(message: str) -> bool:
+    """In a chat that already ended: thanks with a comment and no question —
+    "Gracias y felicidades por pensar que será pronto" — needs no answer."""
+    text = message or ""
+    return "?" not in text and "¿" not in text and len(text.split()) <= 15 and _has_thanks(text)
+
+
 def _is_reaction(message: str) -> bool:
     """A WhatsApp reaction, or a message of only emojis: never a question."""
     text = (message or "").strip()
@@ -2061,7 +2073,8 @@ async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> Wha
             app_name="loan_agents_whatsapp_reservations", user_id=user_id, session_id=user_id)
         _CLOSED_WHATSAPP_CHATS.discard(user_id)
         _HANDOFF_WHATSAPP_CHATS.discard(user_id)
-    if _is_reaction(req.message) or (user_id in _CLOSED_WHATSAPP_CHATS and _is_ack(req.message)):
+    if _is_reaction(req.message) or (user_id in _CLOSED_WHATSAPP_CHATS
+                                     and (_is_ack(req.message) or _is_closing_thanks(req.message))):
         # A reaction is never answered, and an "ok" after a goodbye doesn't reopen the chat.
         return WhatsAppReservationsResponse(reply="", conversationStage="closed")
     session = await _get_or_create_pos_session(
@@ -2102,7 +2115,8 @@ async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> Wha
         context["sharedLocation"] = req.sharedLocation
     if req.staffMessages:
         context["staffMessages"] = [
-            {"text": str(m.get("text"))[:500], "atUtc": m.get("atUtc")}
+            {"text": str(m.get("text"))[:500], "atUtc": m.get("atUtc"),
+             "kind": "notification" if m.get("kind") == "notification" else "team"}
             for m in req.staffMessages[-3:] if isinstance(m, dict) and m.get("text")]
     client = req.client if isinstance(req.client, dict) else {}
     client_status = client.get("status") if client.get("status") in _CLIENT_STATUSES else "unavailable"
@@ -2197,6 +2211,12 @@ async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> Wha
         prev_reply, req.message, pending_action.capability if pending_action else None, classified["outcome"])
     if stage == "open" and outcome in ("explicit_positive", "implicit_positive") and "?" not in reply:
         stage = "closed"  # "en un rato paso" → "¡Te esperamos!": done, nothing left to ask
+    if stage == "open" and "?" not in reply and (
+            (route == "campaign" and _has_thanks(req.message))
+            or (_is_ack(req.message) and any(m.get("kind") == "notification" for m in context.get("staffMessages") or []))):
+        # Campaign thanks after the flow, or "Ok" to a receipt: one short line and
+        # done. Rosa's chat went on for 4 thanks-and-replies (2026-11-13).
+        stage = "closed"
     if stage == "closed":
         _CLOSED_WHATSAPP_CHATS.add(user_id)
     else:
