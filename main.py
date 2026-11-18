@@ -51,6 +51,7 @@ from site_commercial.routes import router as site_router
 from voice.twilio_bridge import router as voice_router
 from metering import MeteredRunner, metering_middleware
 from tools.backend_api import get_credit_score, get_client_loans, list_products, list_suppliers
+from tools.operational_notices import context_notices, fetch_active_notices
 
 logger = logging.getLogger(__name__)
 
@@ -2093,6 +2094,11 @@ async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> Wha
     # reply (still in state before this turn) lets "3" or "sí" be read in context.
     prev_reply = session.state.get("whatsapp_reservations_reply") or ""
     classify_task = asyncio.create_task(_classify_whatsapp_message(req.message, prev_reply))
+    # Operational notices (POS "Avisos operativos": closed today, special hours…) go in
+    # every turn's context so the model never answers from the regular schedule while
+    # one applies. Fetched in parallel, capped, cached 60 s; a failure just omits them.
+    notices_task = asyncio.create_task(asyncio.wait_for(
+        asyncio.to_thread(fetch_active_notices, req.companyId, req.branchId), timeout=3))
     # Hermosillo is UTC-7 all year — same convention as tools/backend_api.py.
     now_local = datetime.now(timezone.utc) - timedelta(hours=7)
     context = {
@@ -2109,6 +2115,13 @@ async def support_whatsapp_reservations(req: WhatsAppReservationsRequest) -> Wha
         ],
         "recentReservation": req.recentReservation,
     }
+    try:
+        notices = context_notices(await notices_task)
+    except Exception as e:  # noqa: BLE001 — timeout or backend error: answer without them
+        logger.warning("[whatsapp_reservations] operational notices unavailable: %s", type(e).__name__)
+        notices = []
+    if notices:
+        context["operationalNotices"] = notices
     if req.adReferral:
         context["adReferral"] = req.adReferral
     if req.sharedLocation:
