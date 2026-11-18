@@ -10,6 +10,7 @@ from tools.backend_api import (
     get_available_slots, get_business_info, get_faqs, get_machine_availability, get_my_reward_points,
     get_promotions, get_reservation_hours, get_reservation_services,
 )
+from tools.operational_notices import fetch_active_notices, filter_slots
 from tools.pending_actions import propose_action
 from tools.safe_tool import never_raise
 
@@ -24,6 +25,17 @@ def _use_trusted_ids(tool, args, tool_context):
         if arg in params:
             args[arg] = tool_context.state.get(state_key)
     return None
+
+
+def _apply_operational_notices(tool, args, tool_context, tool_response):
+    """get_available_slots never offers a slot inside a closure the business published
+    as an operational notice (avisos operativos, POS): the day comes back empty with
+    closedByNotice = the business's own message."""
+    if tool.name != "get_available_slots" or not isinstance(tool_response, dict):
+        return None
+    notices = fetch_active_notices(tool_context.state.get("wa_company_id"), tool_context.state.get("wa_branch_id"))
+    filtered = filter_slots(tool_response, notices)
+    return filtered if filtered is not tool_response else None
 
 
 whatsapp_reservations_agent = Agent(
@@ -54,6 +66,7 @@ whatsapp_reservations_agent = Agent(
         FunctionTool(func=propose_action),
     ],
     before_tool_callback=_use_trusted_ids,
+    after_tool_callback=_apply_operational_notices,
     output_key="whatsapp_reservations_reply",
     # Same chat, same session: "quiero registrarme" is handed to it with
     # transfer_to_agent and it hands back anything else.

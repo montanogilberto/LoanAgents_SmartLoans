@@ -29,6 +29,7 @@ from __future__ import annotations
 from google.adk.tools import ToolContext
 
 from retrieval.contracts import CONTRACTS
+from tools.operational_notices import blocking_notice, fetch_active_notices
 
 
 def propose_action(capability: str, fields: dict, confirmation_summary: str, tool_context: ToolContext) -> dict:
@@ -55,6 +56,17 @@ def propose_action(capability: str, fields: dict, confirmation_summary: str, too
         errors = contract.validate(fields)
         if errors:
             return {"proposed": False, "errors": errors}
+
+    if capability == "CREATE_RESERVATION" and tool_context.state.get("wa_company_id"):
+        # An operational notice (e.g. closed today for lack of water) forbids booking
+        # that day — enforced here, not only in the prompt. Unknown notices (backend
+        # down) fail open: the regular schedule still applies.
+        notices = fetch_active_notices(tool_context.state.get("wa_company_id"), tool_context.state.get("wa_branch_id"))
+        blocked = blocking_notice(notices, str(fields.get("reservationDate") or ""), str(fields.get("timeSlot") or "") or None)
+        if blocked:
+            return {"proposed": False, "errors": [
+                "No se puede reservar en esa fecha/hora por un aviso del negocio: "
+                f"{blocked.get('customerMessage')} Ofrece otro día que no esté afectado."]}
 
     tool_context.state["pending_action"] = {
         "capability": capability,
