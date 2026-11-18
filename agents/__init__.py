@@ -28,6 +28,8 @@ from agents.whatsapp_campaign import whatsapp_campaign_agent
 from agents.voice_secretary import voice_secretary_agent
 from agents.whatsapp_topic import whatsapp_topic_agent
 from agents.whatsapp_insights import whatsapp_insights_agent
+from agents.service_finder import service_finder_agent
+from agents.business_menu import business_menu_agent
 
 root_agent = orchestrator_agent
 
@@ -61,5 +63,7 @@ __all__ = [
     "voice_secretary_agent",
     "whatsapp_topic_agent",
     "whatsapp_insights_agent",
+    "service_finder_agent",
+    "business_menu_agent",
     "root_agent",
 ]

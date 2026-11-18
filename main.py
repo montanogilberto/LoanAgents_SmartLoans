@@ -14,13 +14,17 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from typing import Literal
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from collections import defaultdict, deque
+
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -35,10 +39,15 @@ from agents import (
     pos_income_support_agent, pos_expenses_support_agent, pos_accounting_support_agent,
     pos_rewards_support_agent, whatsapp_reservations_agent, product_extraction_agent,
     product_web_lookup_agent, whatsapp_topic_agent, whatsapp_insights_agent, whatsapp_campaign_agent,
+    service_finder_agent, business_menu_agent,
 )
 from agents.whatsapp_campaign.prompt import runs_campaign
 from agents.support import support_agent
 from agents.whatsapp_topic.prompt import OUTCOMES as WHATSAPP_OUTCOMES, TOPICS as WHATSAPP_TOPICS
+from agents.service_finder.catalog import SERVICES as FINDER_SERVICES, SERVICE_IDS as FINDER_SERVICE_IDS
+from agents.business_menu.catalog import POS_MODULES as MENU_POS_MODULES, MODULE_IDS as MENU_MODULE_IDS
+from agents.business_menu.extract import MAX_FILE_BYTES as MENU_MAX_FILE_BYTES, MenuFileError, file_to_parts as menu_file_to_parts
+from agents.business_intake.website import WebsiteError, fetch_website
 from agents.transfer_extraction.reconcile import review_extraction
 from agents.ticket_extraction.matching import MATCHED, UNAVAILABLE, match_product, match_supplier, parse_pack
 from agents.ticket_extraction.proposal import build_proposal, evaluate
@@ -86,6 +95,8 @@ origins = [
     "https://mango-smoke-0323ed91e.3.azurestaticapps.net",
     "https://proud-grass-09761cb1e.1.azurestaticapps.net",
     "https://ashy-ground-041405f1e.7.azurestaticapps.net",
+    # SmartLoans site (signup service finder)
+    "https://orange-sand-02bfe2210.7.azurestaticapps.net",
 
     # Custom domain
     "https://www.rpmtoolsmx.com",
@@ -174,6 +185,8 @@ _whatsapp_reservations_runner = MeteredRunner(agent=whatsapp_reservations_agent,
 # per message and both read the same chat history.
 _whatsapp_campaign_runner = MeteredRunner(agent=whatsapp_campaign_agent, app_name="loan_agents_whatsapp_reservations", session_service=_session_service)
 _whatsapp_topic_runner = MeteredRunner(agent=whatsapp_topic_agent, app_name="loan_agents_whatsapp_topic", session_service=_session_service)
+_business_menu_runner = MeteredRunner(agent=business_menu_agent, app_name="loan_agents_business_menu", session_service=_session_service)
+_service_finder_runner = MeteredRunner(agent=service_finder_agent, app_name="loan_agents_service_finder", session_service=_session_service)
 _whatsapp_insights_runner = MeteredRunner(agent=whatsapp_insights_agent, app_name="loan_agents_whatsapp_insights", session_service=_session_service)
 
 
@@ -2298,6 +2311,241 @@ async def support_whatsapp_insights(req: WhatsAppInsightsRequest) -> WhatsAppIns
         unmetNeeds=[str(n) for n in result.get("unmetNeeds", []) if n][:10],
         messagesAnalyzed=len(messages),
     )
+
+
+# --------------------------------------------------
+# Signup "Asistente GMO" — which service is the visitor here for?
+# --------------------------------------------------
+# Public: the signup page calls it from the browser before any account exists,
+# so there's no companyId (not billed) — bounded by input limits, a per-IP
+# hourly limit and a timeout instead. Stateless: the page sends the short
+# conversation each time. Read-only, never writes.
+_FINDER_MAX_TURNS = 8          # conversation items kept (visitor + assistant)
+_FINDER_MAX_CHARS = 500
+_FINDER_MAX_QUESTIONS = 2      # clarifying questions before it must decide
+_FINDER_TIMEOUT_SECONDS = 20
+_FINDER_RATE_LIMIT_PER_HOUR = int(os.getenv("SERVICE_FINDER_RATE_LIMIT_PER_HOUR", "30"))
+_finder_calls: dict[str, deque] = defaultdict(deque)
+
+
+class ServiceFinderTurn(BaseModel):
+    role: Literal["assistant", "visitor"]
+    text: str
+
+
+class ServiceFinderRequest(BaseModel):
+    conversation: list[ServiceFinderTurn]
+
+
+class ServiceFinderResponse(BaseModel):
+    status: Literal["recommend", "ask", "unsure"]
+    reply: str
+    service: str | None = None
+    alternatives: list[str] = []
+    options: list[str] = []
+
+
+def _signup_rate_limit(request: Request, calls: dict[str, deque], per_hour: int) -> None:
+    """Per-IP hourly limit for the public signup endpoints (no account yet, so no company to bill)."""
+    forwarded = request.headers.get("x-forwarded-for", "")
+    ip = forwarded.split(",")[0].strip().split(":")[0] if forwarded else (request.client.host if request.client else "unknown")
+    now = time.monotonic()
+    window = calls[ip]
+    while window and now - window[0] > 3600:
+        window.popleft()
+    if len(window) >= per_hour:
+        raise HTTPException(status_code=429, detail="Demasiadas consultas. Intenta más tarde.")
+    window.append(now)
+
+
+def _finder_response(result: dict, questions_left: int) -> ServiceFinderResponse:
+    """Keeps only what the page can act on: known service ids, a bounded
+    question with tappable options, and no question once the budget is spent."""
+    reply = str(result.get("reply") or "").strip()[:400]
+    status = result.get("status")
+    service = result.get("service")
+    if status == "recommend" and service in FINDER_SERVICE_IDS:
+        alternatives = [a for a in result.get("alternatives") or [] if a in FINDER_SERVICE_IDS and a != service][:2]
+        return ServiceFinderResponse(status="recommend", service=service, alternatives=alternatives, reply=reply)
+    options = [str(o).strip()[:60] for o in result.get("options") or [] if str(o).strip()][:4]
+    if status == "ask" and questions_left > 0 and reply and len(options) >= 2:
+        return ServiceFinderResponse(status="ask", reply=reply, options=options)
+    return ServiceFinderResponse(
+        status="unsure",
+        reply=reply if status == "unsure" and reply else "No estoy seguro de cuál te conviene. Elige el servicio que buscas:")
+
+
+@app.post("/signup/service-finder", response_model=ServiceFinderResponse)
+async def signup_service_finder(req: ServiceFinderRequest, request: Request) -> ServiceFinderResponse:
+    turns = [{"role": t.role, "text": t.text.strip()[:_FINDER_MAX_CHARS]}
+             for t in req.conversation if t.text and t.text.strip()][-_FINDER_MAX_TURNS:]
+    if not turns or turns[-1]["role"] != "visitor":
+        raise HTTPException(status_code=400, detail="Escribe qué buscas.")
+    questions_left = max(0, _FINDER_MAX_QUESTIONS - sum(1 for t in turns if t["role"] == "assistant"))
+    _signup_rate_limit(request, _finder_calls, _FINDER_RATE_LIMIT_PER_HOUR)
+    try:
+        result = await asyncio.wait_for(
+            _run_one_shot_json(_service_finder_runner, "loan_agents_service_finder", "service_finder_result",
+                               {"services": list(FINDER_SERVICES), "conversation": turns,
+                                "questionsLeft": questions_left}),
+            timeout=_FINDER_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="El asistente tardó demasiado. Intenta de nuevo.")
+    except Exception:
+        logger.exception("[service_finder] run failed")
+        raise HTTPException(status_code=502, detail="El asistente no está disponible. Elige tu servicio abajo.")
+    response = _finder_response(result, questions_left)
+    logger.info("[service_finder] turns=%d status=%s service=%s", len(turns), response.status, response.service)
+    return response
+
+
+# --------------------------------------------------
+# POS signup — "Sube tu menú o catálogo": what does this new business sell?
+# --------------------------------------------------
+# Public (called from the signup wizard before the account is finished), so
+# bounded like the service finder: size/type limits, per-IP hourly limit,
+# timeout. Read-only: returns a summary, a draft item list and suggested POS
+# modules; storing or importing anything is the frontend/backend's job.
+_MENU_TIMEOUT_SECONDS = 60
+_MENU_RATE_LIMIT_PER_HOUR = int(os.getenv("BUSINESS_MENU_RATE_LIMIT_PER_HOUR", "15"))
+_MENU_MAX_ITEMS = 60
+_menu_calls: dict[str, deque] = defaultdict(deque)
+
+
+class BusinessMenuRequest(BaseModel):
+    businessName: str | None = None
+    url: str | None = None
+    fileBase64: str | None = None
+    mimeType: str | None = None
+    fileName: str | None = None
+
+
+class BusinessMenuItem(BaseModel):
+    name: str
+    price: float | None = None
+
+
+class BusinessMenuCategory(BaseModel):
+    name: str
+    items: list[BusinessMenuItem] = []
+
+
+class BusinessMenuResponse(BaseModel):
+    readable: bool
+    businessType: str = ""
+    summary: str = ""
+    categories: list[BusinessMenuCategory] = []
+    itemCount: int = 0
+    suggestedModules: list[str] = []
+    questions: list[str] = []
+
+
+async def _run_one_shot_parts(runner, app_name: str, output_key: str, parts: list) -> dict:
+    """Like _run_one_shot_json, for multimodal input (a document/image Part
+    next to the JSON context)."""
+    user_id = app_name
+    session = await _session_service.create_session(
+        app_name=app_name, user_id=user_id, session_id=str(uuid.uuid4()), state={output_key: ""})
+    try:
+        raw = ""
+        async for event in runner.run_async(user_id=user_id, session_id=session.id,
+                                            new_message=Content(role="user", parts=parts)):
+            if event.is_final_response() and event.content and event.content.parts:
+                text = "".join(p.text or "" for p in event.content.parts if not getattr(p, "thought", False)).strip()
+                if text:
+                    raw = text
+        try:
+            result = json.loads(_strip_json_fences(raw)) if raw else {}
+        except json.JSONDecodeError:
+            result = {}
+        return result if isinstance(result, dict) else {}
+    finally:
+        await _session_service.delete_session(app_name=app_name, user_id=user_id, session_id=session.id)
+
+
+def _business_menu_response(result: dict) -> BusinessMenuResponse:
+    """Keeps known module ids, bounded text and at most _MENU_MAX_ITEMS items."""
+    categories: list[BusinessMenuCategory] = []
+    budget = _MENU_MAX_ITEMS
+    for c in result.get("categories") or []:
+        if not isinstance(c, dict) or budget <= 0:
+            continue
+        items = []
+        for it in c.get("items") or []:
+            if budget <= 0 or not isinstance(it, dict) or not str(it.get("name") or "").strip():
+                continue
+            price = it.get("price")
+            try:
+                price = round(float(price), 2) if price is not None and float(price) >= 0 else None
+            except (TypeError, ValueError):
+                price = None
+            items.append(BusinessMenuItem(name=str(it["name"]).strip()[:120], price=price))
+            budget -= 1
+        if items:
+            categories.append(BusinessMenuCategory(name=str(c.get("name") or "General").strip()[:80], items=items))
+    readable = bool(result.get("readable", bool(categories)))
+    return BusinessMenuResponse(
+        readable=readable,
+        businessType=str(result.get("businessType") or "").strip()[:80],
+        summary=str(result.get("summary") or "").strip()[:500],
+        categories=categories if readable else [],
+        itemCount=sum(len(c.items) for c in categories) if readable else 0,
+        suggestedModules=[m for m in dict.fromkeys(result.get("suggestedModules") or []) if m in MENU_MODULE_IDS] if readable else [],
+        questions=[str(q).strip()[:200] for q in (result.get("questions") or []) if str(q).strip()][:3] if readable else [],
+    )
+
+
+@app.post("/signup/business-menu", response_model=BusinessMenuResponse)
+async def signup_business_menu(req: BusinessMenuRequest, request: Request) -> BusinessMenuResponse:
+    url = (req.url or "").strip()
+    if not req.fileBase64 and not url:
+        raise HTTPException(status_code=400, detail="Sube un archivo o escribe la dirección de tu página.")
+    material: list[Part]
+    source: str
+    if req.fileBase64:
+        if len(req.fileBase64) > MENU_MAX_FILE_BYTES * 4 // 3 + 4:
+            raise HTTPException(status_code=413, detail="El archivo es muy grande (máximo 8 MB).")
+        try:
+            data = base64.b64decode(req.fileBase64, validate=True)
+        except (ValueError, base64.binascii.Error):
+            raise HTTPException(status_code=400, detail="No pude leer el archivo. Intenta subirlo de nuevo.")
+        try:
+            material = menu_file_to_parts(data, req.mimeType or "", req.fileName or "")
+        except MenuFileError as exc:
+            raise HTTPException(status_code=415, detail=str(exc))
+        source = "file"
+    else:
+        if not url.lower().startswith(("http://", "https://")):
+            url = f"https://{url}"
+        _signup_rate_limit(request, _menu_calls, _MENU_RATE_LIMIT_PER_HOUR)
+        try:
+            page = await asyncio.wait_for(asyncio.to_thread(fetch_website, url), timeout=15)
+        except (WebsiteError, asyncio.TimeoutError):
+            raise HTTPException(status_code=422, detail="No pude abrir esa página. Revisa la dirección o sube un archivo.")
+        text = "\n".join(x for x in (page.get("title"), page.get("description"), page.get("text")) if x)
+        if not text.strip():
+            raise HTTPException(status_code=422, detail="Esa página no tiene texto que pueda leer. Sube tu menú como archivo.")
+        material = [Part(text=f"Página: {page.get('url')}\n\n{text}")]
+        source = "url"
+    if source == "file":
+        _signup_rate_limit(request, _menu_calls, _MENU_RATE_LIMIT_PER_HOUR)
+
+    context = {"businessName": (req.businessName or "").strip()[:100] or None,
+               "modules": list(MENU_POS_MODULES), "source": source}
+    try:
+        result = await asyncio.wait_for(
+            _run_one_shot_parts(_business_menu_runner, "loan_agents_business_menu", "business_menu_result",
+                                [Part(text=json.dumps(context, ensure_ascii=False)), *material]),
+            timeout=_MENU_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="El análisis tardó demasiado. Intenta con un archivo más pequeño.")
+    except Exception:
+        logger.exception("[business_menu] run failed")
+        raise HTTPException(status_code=502, detail="No pude analizar tu menú ahorita. Puedes continuar sin él.")
+    response = _business_menu_response(result)
+    logger.info("[business_menu] source=%s readable=%s items=%d modules=%s",
+                source, response.readable, response.itemCount, response.suggestedModules)
+    return response
 
 
 class OrderStaleEntry(BaseModel):
