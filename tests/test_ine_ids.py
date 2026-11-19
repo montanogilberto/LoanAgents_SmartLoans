@@ -35,3 +35,27 @@ def test_empty_stays_empty_and_unflagged():
 def test_prompt_asks_for_both_fields_and_never_guessing():
     assert '"cic"' in INSTRUCTION and '"ocr"' in INSTRUCTION
     assert "IDMEX" in INSTRUCTION
+
+
+from agents.id_document.ine_ids import clean_vigencia
+
+
+def test_vigencia_takes_the_last_year_of_a_range():
+    assert clean_vigencia("2023 - 2033") == ("2033", False)
+
+
+def test_vigencia_single_year():
+    assert clean_vigencia("2025") == ("2025", False)
+
+
+def test_vigencia_out_of_range_is_dropped():
+    assert clean_vigencia("1999") == ("", True)
+
+
+def test_vigencia_unreadable_is_flagged_and_empty_is_not():
+    assert clean_vigencia("VIGENCIA ??") == ("", True)
+    assert clean_vigencia("") == ("", False)
+
+
+def test_prompt_asks_for_vigencia():
+    assert '"vigencia"' in INSTRUCTION and "VIGENCIA" in INSTRUCTION

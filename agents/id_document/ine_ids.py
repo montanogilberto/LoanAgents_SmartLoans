@@ -33,3 +33,17 @@ def clean_ine_ids(cic, ocr) -> tuple[str, str, list[str]]:
         dropped.append("ocr")
         ocr_digits = ""
     return cic_digits, ocr_digits, dropped
+
+
+def clean_vigencia(value) -> tuple[str, bool]:
+    """('YYYY', dropped) — the LAST 4-digit year printed after "VIGENCIA" on the
+    front (a range "2023 - 2033" means valid through Dec 31, 2033). Years
+    outside 2000–2100 are blanked and flagged. Expiry itself is judged by the
+    app/back end against today's date, not here."""
+    years = [int(y) for y in re.findall(r"\d{4}", str(value or ""))]
+    if not years:
+        return "", bool(str(value or "").strip())
+    year = max(years)
+    if not 2000 <= year <= 2100:
+        return "", True
+    return str(year), False

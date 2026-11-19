@@ -32,8 +32,9 @@ from google.adk.runners import Runner  # noqa: F401 — kept for type references
 from google.adk.sessions import InMemorySessionService
 from google.genai.types import Content, Part
 
-from agents.id_document.ine_ids import clean_ine_ids
+from agents.id_document.ine_ids import clean_ine_ids, clean_vigencia
 from agents.id_document.curp import clean_curp
+from agents.id_document.clave_elector import clean_clave_elector
 
 from agents import (
     orchestrator_agent, contract_agent, id_document_agent, face_validation_agent,
@@ -446,6 +447,8 @@ class ExtractIdFields(BaseModel):
     # RFC-015: from the BACK's machine-readable zone. 9 / 13 digits or empty.
     cic: str = ""
     ocr: str = ""
+    # RFC-015: last year of the front's "VIGENCIA" (valid through Dec 31), or empty.
+    vigencia: str = ""
 
 
 class ExtractIdResponse(BaseModel):
@@ -518,18 +521,27 @@ async def extract_id_fields(req: ExtractIdRequest) -> ExtractIdResponse:
     # CIC/OCR feed an INE authenticity check: a wrong digit count is blanked
     # (and flagged) instead of passed on — agents/id_document/ine_ids.py.
     cic, ocr, dropped = clean_ine_ids(result.get("cic", ""), result.get("ocr", ""))
+    vigencia, vigencia_dropped = clean_vigencia(result.get("vigencia", ""))
+    if vigencia_dropped:
+        dropped.append("vigencia")
     # CURP: kept only when its check digit confirms the reading — agents/id_document/curp.py.
     curp, curp_flags = clean_curp(result.get("curp", ""), result.get("fechaNacimiento", ""))
+    # Clave de elector: 18-character layout, cross-checked with the birth date and
+    # the (check-digit-valid) CURP — agents/id_document/clave_elector.py.
+    clave_elector, clave_flags = clean_clave_elector(
+        result.get("claveElector", ""), result.get("fechaNacimiento", ""), curp,
+    )
     fields = ExtractIdFields(
         nombre=result.get("nombre", ""),
         domicilio=result.get("domicilio", ""),
         curp=curp,
-        claveElector=result.get("claveElector", ""),
+        claveElector=clave_elector,
         fechaNacimiento=result.get("fechaNacimiento", ""),
         cic=cic,
         ocr=ocr,
+        vigencia=vigencia,
     )
-    low_confidence = list(dict.fromkeys([*(result.get("lowConfidenceFields") or []), *dropped, *curp_flags]))
+    low_confidence = list(dict.fromkeys([*(result.get("lowConfidenceFields") or []), *dropped, *curp_flags, *clave_flags]))
     return ExtractIdResponse(fields=fields, lowConfidenceFields=low_confidence)
 
 
