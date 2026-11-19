@@ -32,6 +32,9 @@ from google.adk.runners import Runner  # noqa: F401 — kept for type references
 from google.adk.sessions import InMemorySessionService
 from google.genai.types import Content, Part
 
+from agents.id_document.ine_ids import clean_ine_ids
+from agents.id_document.curp import clean_curp
+
 from agents import (
     orchestrator_agent, contract_agent, id_document_agent, face_validation_agent,
     analysis_agent, evidence_validation_agent, transfer_extraction_agent, cash_register_agent, expense_agent,
@@ -440,6 +443,9 @@ class ExtractIdFields(BaseModel):
     curp: str = ""
     claveElector: str = ""
     fechaNacimiento: str = ""
+    # RFC-015: from the BACK's machine-readable zone. 9 / 13 digits or empty.
+    cic: str = ""
+    ocr: str = ""
 
 
 class ExtractIdResponse(BaseModel):
@@ -509,14 +515,22 @@ async def extract_id_fields(req: ExtractIdRequest) -> ExtractIdResponse:
     except json.JSONDecodeError:
         result = {}
 
+    # CIC/OCR feed an INE authenticity check: a wrong digit count is blanked
+    # (and flagged) instead of passed on — agents/id_document/ine_ids.py.
+    cic, ocr, dropped = clean_ine_ids(result.get("cic", ""), result.get("ocr", ""))
+    # CURP: kept only when its check digit confirms the reading — agents/id_document/curp.py.
+    curp, curp_flags = clean_curp(result.get("curp", ""), result.get("fechaNacimiento", ""))
     fields = ExtractIdFields(
         nombre=result.get("nombre", ""),
         domicilio=result.get("domicilio", ""),
-        curp=result.get("curp", ""),
+        curp=curp,
         claveElector=result.get("claveElector", ""),
         fechaNacimiento=result.get("fechaNacimiento", ""),
+        cic=cic,
+        ocr=ocr,
     )
-    return ExtractIdResponse(fields=fields, lowConfidenceFields=result.get("lowConfidenceFields", []))
+    low_confidence = list(dict.fromkeys([*(result.get("lowConfidenceFields") or []), *dropped, *curp_flags]))
+    return ExtractIdResponse(fields=fields, lowConfidenceFields=low_confidence)
 
 
 class FaceAsset(BaseModel):
