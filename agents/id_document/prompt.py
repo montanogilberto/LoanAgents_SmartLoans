@@ -30,11 +30,18 @@ blanks the address, not the name.
   service verifies your reading and discards it if it does not match. Return
   "" only when the CURP is not visible at all. Do not confuse it with
   CLAVE DE ELECTOR (different code).
-- claveElector: the "CLAVE DE ELECTOR" code exactly as printed
+- claveElector: the "CLAVE DE ELECTOR" code exactly as printed — 18 characters:
+  6 letters, 6 digits (birth date YYMMDD), 2 digits (state), H or M, 3 digits.
+  The service checks this layout and discards a reading that does not fit, so
+  never pad, trim or invent characters to make it fit
 - fechaNacimiento: date of birth exactly as printed, format DD/MM/YYYY. If a
   digit is unreadable, return "" — do not fill it in from the CURP or any
   other part of the card. The service compares this date against the CURP, so
   each must be read on its own.
+
+- vigencia: from the FRONT, the "VIGENCIA" field. It shows a year range
+  ("2023 - 2033") or a single year ("2025"). Return ONLY the LAST year, as 4
+  digits (e.g. "2033"). Empty if not clearly legible.
 
 From the BACK only (skip both if no back image is attached). Read them from
 the machine-readable zone: the lines at the bottom made of letters, digits
@@ -73,6 +80,7 @@ Output ONLY a JSON object with exactly these keys, no prose, no markdown fences:
   "curp": "<string or empty>",
   "claveElector": "<string or empty>",
   "fechaNacimiento": "<DD/MM/YYYY or empty>",
+  "vigencia": "<4-digit year or empty>",
   "cic": "<9 digits or empty>",
   "ocr": "<13 digits or empty>",
   "lowConfidenceFields": ["<field names, per the rule above>"]
