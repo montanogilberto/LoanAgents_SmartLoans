@@ -62,6 +62,9 @@ from config.settings import PORT
 from intake_api import router as intake_router
 from site_commercial.routes import router as site_router
 from voice.twilio_bridge import router as voice_router
+from voice.collections_bridge import router as collections_voice_router
+from collections_api import router as collections_router
+from proof_documents_api import router as proof_documents_router
 from metering import MeteredRunner, metering_middleware
 from tools.backend_api import get_credit_score, get_client_loans, list_products, list_suppliers
 from tools.operational_notices import context_notices, fetch_active_notices
@@ -131,6 +134,11 @@ app.include_router(intake_router)
 app.include_router(site_router)
 # Live phone calls: Twilio Media Streams <-> Gemini Live (voice/twilio_bridge.py).
 app.include_router(voice_router)
+# Loan collections: each refuses everything until its own secret is set.
+app.include_router(collections_voice_router)
+app.include_router(collections_router)
+# Comprobante de domicilio / nómina vs INE. Same rule: off until enabled.
+app.include_router(proof_documents_router)
 
 
 def _strip_json_fences(text: str) -> str:
