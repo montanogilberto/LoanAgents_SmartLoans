@@ -186,3 +186,35 @@ def test_separate_agent_mounted_in_main():
         ws.send_json({"event": "start", "start": {}})
         with pytest.raises(WebSocketDisconnect):
             ws.receive_json()
+
+
+def test_tool_calls_are_delivered_before_the_turn_ends():
+    """Gemini waits for the tool response before turn_complete: holding the call deadlocks."""
+    from google.genai import types
+    from voice.live_tools import deliver_tool_calls_now
+    answered = asyncio.Event()
+
+    class Session:
+        async def receive(self):
+            yield types.LiveServerMessage(tool_call=types.LiveServerToolCall(
+                function_calls=[types.FunctionCall(id="1", name="end_call", args={})]))
+            await answered.wait()
+            yield types.LiveServerMessage(server_content=types.LiveServerContent(turn_complete=True))
+
+    class Connection:
+        _gemini_session = Session()
+
+        async def receive(self):
+            async for m in self._gemini_session.receive():
+                assert m.tool_call is None
+                if m.server_content:
+                    yield "turn_complete"
+
+    async def run():
+        out = []
+        async for r in deliver_tool_calls_now(Connection()).receive():
+            out.append(r)
+            answered.set()
+        return out
+    out = asyncio.run(asyncio.wait_for(run(), 5))
+    assert out[0].content.parts[0].function_call.name == "end_call" and out[1] == "turn_complete"

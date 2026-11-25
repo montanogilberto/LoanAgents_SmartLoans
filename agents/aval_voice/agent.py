@@ -19,6 +19,7 @@ from agents.aval_voice import live_state, rules
 from agents.aval_voice.prompt import INSTRUCTION
 from loan_collections.handoff import request_human as _human
 from tools.pending_actions import propose_action as _propose_action
+from voice.live_tools import deliver_tool_calls_now
 
 VOICE_MODEL = os.environ.get("VOICE_MODEL", "gemini-2.5-flash-native-audio-latest")
 VOICE_THINKING_BUDGET = os.environ.get("VOICE_THINKING_BUDGET", "0")   # thinking = dead air
@@ -39,7 +40,7 @@ class LiveGemini(Gemini):
             llm_request.live_connect_config.thinking_config = types.ThinkingConfig(
                 thinking_budget=self.thinking_budget)
         async with super().connect(llm_request) as connection:
-            yield connection
+            yield deliver_tool_calls_now(connection)
 
 
 async def _heard(session_id, since: float, fallback: str, ok) -> str:
