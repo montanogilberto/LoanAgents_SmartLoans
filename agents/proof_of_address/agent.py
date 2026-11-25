@@ -11,7 +11,5 @@ proof_of_address_agent = Agent(
     model="gemini-2.5-flash",
     instruction=lambda _ctx: INSTRUCTION,
     output_schema=ProofOfAddress,
-    generate_content_config=types.GenerateContentConfig(
-        temperature=0.0, top_p=0.1, top_k=1, media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH,
-    ),
+    generate_content_config=types.GenerateContentConfig(temperature=0.0, top_p=0.1, top_k=1),
 )

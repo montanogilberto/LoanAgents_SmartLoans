@@ -27,6 +27,7 @@ from agents.whatsapp_registration import whatsapp_registration_agent
 from agents.whatsapp_campaign import whatsapp_campaign_agent
 from agents.voice_secretary import voice_secretary_agent
 from agents.collections_voice import collections_voice_agent
+from agents.aval_voice import aval_voice_agent
 from agents.collections_whatsapp import collections_whatsapp_agent
 from agents.whatsapp_topic import whatsapp_topic_agent
 from agents.whatsapp_insights import whatsapp_insights_agent
@@ -66,6 +67,7 @@ __all__ = [
     "whatsapp_campaign_agent",
     "voice_secretary_agent",
     "collections_voice_agent",
+    "aval_voice_agent",
     "collections_whatsapp_agent",
     "whatsapp_topic_agent",
     "whatsapp_insights_agent",
