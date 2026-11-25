@@ -167,6 +167,16 @@ CONTRACTS: dict[str, Contract] = {
             FieldSpec("reason", str, required=True),
         ),
     ),
+    "PROMISE_TO_PAY": Contract(
+        capability="PROMISE_TO_PAY",
+        description="agents/collections_voice and collections_whatsapp — the date and amount a borrower says "
+                    "they will pay; never a payment. The loan comes from the route, never from the agent",
+        fields=(
+            FieldSpec("amount", float, required=True, min_value=0.01),
+            FieldSpec("weekday", str, required=True),
+            FieldSpec("date", str, required=True, pattern=r"\d{4}-\d{2}-\d{2}"),
+        ),
+    ),
     "SEND_CLIENT_QR": Contract(
         capability="SEND_CLIENT_QR",
         description="agents/whatsapp_reservations — the sender's own client QR (CLIENT:<id>:<name>, the one the POS scanner reads); the backend matches the client by the WhatsApp phone and sends the image (no confirmation step)",
