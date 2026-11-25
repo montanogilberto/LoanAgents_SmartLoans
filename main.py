@@ -63,6 +63,7 @@ from intake_api import router as intake_router
 from site_commercial.routes import router as site_router
 from voice.twilio_bridge import router as voice_router
 from voice.collections_bridge import router as collections_voice_router
+from voice.aval_bridge import router as aval_voice_router
 from collections_api import router as collections_router
 from proof_documents_api import router as proof_documents_router
 from metering import MeteredRunner, metering_middleware
@@ -137,6 +138,8 @@ app.include_router(voice_router)
 # Loan collections: each refuses everything until its own secret is set.
 app.include_router(collections_voice_router)
 app.include_router(collections_router)
+# Calls to a proposed aval: off until AVAL_CALL_SECRET is set.
+app.include_router(aval_voice_router)
 # Comprobante de domicilio / nómina vs INE. Same rule: off until enabled.
 app.include_router(proof_documents_router)
 

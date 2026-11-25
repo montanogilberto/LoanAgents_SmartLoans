@@ -177,6 +177,19 @@ CONTRACTS: dict[str, Contract] = {
             FieldSpec("date", str, required=True, pattern=r"\d{4}-\d{2}-\d{2}"),
         ),
     ),
+    "GUARANTOR_CALL_RESULT": Contract(
+        capability="GUARANTOR_CALL_RESULT",
+        description="agents/aval_voice — what a proposed aval answered on the phone. Complementary evidence: it never "
+                    "formalizes an aval nor verifies GUARANTOR. Who was called comes from the signed token",
+        fields=(
+            FieldSpec("outcome", str, required=True,
+                      enum=("ACCEPTS", "DECLINES", "UNSURE", "DOES_NOT_KNOW_APPLICANT")),
+            FieldSpec("knowsApplicant", str, required=True, enum=("yes", "no", "unsure")),
+            FieldSpec("relationshipCheck", str, required=True,
+                      enum=("MATCH", "DIFFERENT", "UNCLEAR", "NOT_COMPARED")),
+            FieldSpec("understandsObligation", str, required=True, enum=("yes", "no", "unsure")),
+        ),
+    ),
     "SEND_CLIENT_QR": Contract(
         capability="SEND_CLIENT_QR",
         description="agents/whatsapp_reservations — the sender's own client QR (CLIENT:<id>:<name>, the one the POS scanner reads); the backend matches the client by the WhatsApp phone and sends the image (no confirmation step)",
