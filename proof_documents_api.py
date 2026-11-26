@@ -70,6 +70,7 @@ class ProofResponse(BaseModel):
     verdict: str                      # MATCH | REVIEW | MISMATCH | WRONG_DOCUMENT | UNREADABLE
     checks: dict[str, str]            # MATCH | PARTIAL | MISMATCH | MISSING
     addressParts: dict[str, str] = {}
+    monthlyNetEstimate: float | None = None   # payroll only; a proposal, the SP computes the stored one
     reasons: list[str]
     confidence: float
     fields: dict

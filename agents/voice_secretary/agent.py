@@ -21,6 +21,7 @@ from agents.voice_secretary.calendar_check import check_agreement_slot
 from agents.voice_secretary.prompt import INSTRUCTION
 from tools.backend_api import get_faqs
 from tools.pending_actions import propose_action as _propose_action
+from voice.live_tools import deliver_tool_calls_now
 from tools.safe_tool import never_raise
 
 VOICE_MODEL = os.environ.get("VOICE_MODEL", "gemini-2.5-flash-native-audio-latest")
@@ -40,7 +41,7 @@ class LiveGemini(Gemini):
             llm_request.live_connect_config.thinking_config = types.ThinkingConfig(
                 thinking_budget=self.thinking_budget)
         async with super().connect(llm_request) as connection:
-            yield connection
+            yield deliver_tool_calls_now(connection)
 
 
 # A clear "it's me". "¿Bueno?" alone is how Mexicans answer the phone, not a yes;

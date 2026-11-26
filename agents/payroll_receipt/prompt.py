@@ -10,7 +10,7 @@ You only read what is printed; other code and a person validate it.
 - curp (18 characters) and rfc (13): the WORKER's, read character by character. Never
   the employer's RFC, and never adjust a character to make the code look well-formed.
 - payDate, periodStart, periodEnd: YYYY-MM-DD. Mexican dates print the day first.
-- payFrequency: "Quinc." is SEMIMONTHLY.
+- payFrequency: as printed. "Quinc." is SEMIMONTHLY, "Catorcenal" is BIWEEKLY_14.
 - grossMXN, deductionsMXN, netMXN: the printed totals of this payslip. Never compute
   one from the others; a monthly base salary is not the gross total.
 - fiscalFolio: the CFDI "Folio fiscal" (UUID); join it if it wraps to the next line.
