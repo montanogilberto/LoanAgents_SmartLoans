@@ -23,6 +23,7 @@ from agents.collections_voice.prompt import INSTRUCTION
 from loan_collections.handoff import SAYS_PAID, request_human
 from loan_collections.situation import check_promise, hermosillo_now
 from tools.pending_actions import propose_action as _propose_action
+from voice.live_tools import deliver_tool_calls_now
 
 VOICE_MODEL = os.environ.get("VOICE_MODEL", "gemini-2.5-flash-native-audio-latest")
 # Thinking adds dead air before each answer on the phone. "" = model default.
@@ -41,7 +42,7 @@ class LiveGemini(Gemini):
             llm_request.live_connect_config.thinking_config = types.ThinkingConfig(
                 thinking_budget=self.thinking_budget)
         async with super().connect(llm_request) as connection:
-            yield connection
+            yield deliver_tool_calls_now(connection)
 
 
 _NOT_SPEECH = re.compile(r"<[^>]*>")

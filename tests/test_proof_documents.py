@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 import proof_documents_api as api
 from agents.id_document.curp import check_digit
 from proof_documents.matching import match_address, match_name
-from proof_documents.review import review_address, review_payroll
+from proof_documents.review import monthly_net, review_address, review_payroll
 
 TODAY = date(2026, 11, 24)
 CURP = "LOPA900101MSRPRN0"
@@ -22,6 +22,7 @@ BILL = {"documentType": "INTERNET", "holderName": "ANA LOPEZ PENA", "street": "G
         "billingMonth": "2026-11", "dueDate": "2026-11-20", "confidence": 0.95, "signsOfEditing": False}
 SLIP = {"documentType": "PAYROLL", "workerName": "ANA LÓPEZ PEÑA", "curp": CURP, "rfc": CURP[:10] + "AB1",
         "payDate": "2026-11-12", "grossMXN": 100.0, "deductionsMXN": 40.0, "netMXN": 60.0,
+        "payFrequency": "SEMIMONTHLY", "periodStart": "2026-11-01", "periodEnd": "2026-11-15",
         "confidence": 0.95, "fiscalFolio": "", "signsOfEditing": False}
 
 
@@ -89,6 +90,41 @@ def test_bill_verdict(change, verdict):
 ])
 def test_payroll_verdict(change, verdict):
     assert review_payroll({**SLIP, **change}, INE, TODAY, 90)["verdict"] == verdict
+
+
+@pytest.mark.parametrize("frequency,start,end,check", [
+    ("WEEKLY", "2026-11-02", "2026-11-08", "MATCH"), ("BIWEEKLY_14", "2026-11-02", "2026-11-15", "MATCH"),
+    ("SEMIMONTHLY", "2026-11-16", "2026-11-30", "MATCH"), ("SEMIMONTHLY", "2026-02-16", "2026-02-28", "MATCH"),
+    ("MONTHLY", "2026-11-01", "2026-11-30", "MATCH"),
+    ("SEMIMONTHLY", "2026-11-02", "2026-11-15", "MISMATCH"),   # "Quinc." printed, but a 14-day period
+    ("WEEKLY", "2026-11-01", "2026-11-15", "MISMATCH"),
+    ("SEMIMONTHLY", "", "", "PARTIAL"), ("SEMIMONTHLY", "2026-11-15", "2026-11-01", "PARTIAL"),
+    ("OTHER", "2026-11-01", "2026-11-15", "MISSING"), ("UNKNOWN", "2026-11-01", "2026-11-15", "MISSING"),
+])
+def test_payroll_frequency_against_the_period(frequency, start, end, check):
+    result = review_payroll({**SLIP, "payFrequency": frequency, "periodStart": start, "periodEnd": end}, INE, TODAY, 90)
+    assert result["checks"]["payFrequency"] == check
+    assert result["verdict"] == ("MATCH" if check == "MATCH" else "REVIEW")
+    assert (result["monthlyNetEstimate"] is not None) == (check == "MATCH")
+
+
+@pytest.mark.parametrize("net,frequency,monthly", [
+    (1000.0, "WEEKLY", 4333.33), (1000.0, "FOURTEEN_DAYS", 2166.66), (1000.0, "SEMI_MONTHLY", 2000.0),
+    (1000.0, "MONTHLY", 1000.0), (2503.07, "WEEKLY", 10846.63), (0.0, "WEEKLY", None), (1000.0, "", None),
+])
+def test_monthly_net_rounds_down(net, frequency, monthly):
+    assert monthly_net(net, frequency) == monthly
+
+
+def test_payroll_names_the_frequency_like_the_income_verification():
+    result = review_payroll({**SLIP, "payFrequency": "BIWEEKLY_14", "periodStart": "2026-11-02",
+                             "periodEnd": "2026-11-15"}, INE, TODAY, 90)
+    assert result["fields"]["payFrequency"] == "FOURTEEN_DAYS" and result["monthlyNetEstimate"] == 130.0
+
+
+def test_no_estimate_when_totals_do_not_add_up():
+    result = review_payroll({**SLIP, "netMXN": 90.0}, INE, TODAY, 90)
+    assert result["verdict"] == "REVIEW" and result["monthlyNetEstimate"] is None
 
 
 def test_payroll_ignores_the_ine_address():
