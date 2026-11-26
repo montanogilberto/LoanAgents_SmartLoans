@@ -121,7 +121,7 @@ SCENARIOS: dict[str, Scenario] = {
                         [outcome("ACCEPTS", knowsApplicant="yes", relationshipCheck="MATCH", understandsObligation="yes"),
                          explained, ended_by_agent]),
     "declines": Scenario(ANA + "Entiendes lo que es ser aval, pero no quieres serlo.",
-                         [outcome("DECLINES"), explained, ended_by_agent]),
+                         [outcome("DECLINES"), ended_by_agent]),
     "thinks": Scenario(ANA + "Entiendes la explicación, pero cuando te preguntan si quieres seguir dices que "
                        "lo tienes que pensar y platicar con tu familia.", [not_accepted, explained, ended_by_agent]),
     "unknown": Scenario(ANA.replace("Luis Ramírez es tu hermano. ", "No conoces a ningún Luis Ramírez."),

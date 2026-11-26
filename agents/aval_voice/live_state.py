@@ -9,6 +9,7 @@ read it back. In-process only — one entry per live call, removed when it ends.
 """
 from __future__ import annotations
 
+import contextvars
 import time
 from dataclasses import dataclass, field
 
@@ -24,6 +25,12 @@ class _Call:
 
 
 _CALLS: dict[str, _Call] = {}
+# Set by the bridge before its tasks start, so the live connection knows its call.
+current_session: contextvars.ContextVar[str | None] = contextvars.ContextVar("aval_session", default=None)
+
+
+def hear(text: str) -> None:
+    add_customer_text(current_session.get(), text)
 
 
 def register(session_id: str) -> None:

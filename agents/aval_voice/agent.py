@@ -24,8 +24,8 @@ from voice.live_tools import deliver_tool_calls_now
 VOICE_MODEL = os.environ.get("VOICE_MODEL", "gemini-2.5-flash-native-audio-latest")
 VOICE_THINKING_BUDGET = os.environ.get("VOICE_THINKING_BUDGET", "0")   # thinking = dead air
 
-_TRANSCRIPT_WAIT_S = 0.6    # input transcription arrives after the audio
-_MAX_WAITS = 2              # a tool call per wait: no event arrives while a tool runs
+_TRANSCRIPT_WAIT_S = 1.5    # input transcription arrives after the audio
+_MAX_WAITS = 1
 QUESTIONS = ("relationship", "understands", "decision")
 
 
@@ -40,7 +40,7 @@ class LiveGemini(Gemini):
             llm_request.live_connect_config.thinking_config = types.ThinkingConfig(
                 thinking_budget=self.thinking_budget)
         async with super().connect(llm_request) as connection:
-            yield deliver_tool_calls_now(connection)
+            yield deliver_tool_calls_now(connection, live_state.hear)
 
 
 async def _heard(session_id, since: float, fallback: str, ok) -> str:
@@ -106,7 +106,7 @@ async def record_answer(question: str, answer: str, their_words: str, tool_conte
     done = dict(state.get("aval_answers") or {})
     if question == "understands" and done.get("relationship") != "yes":
         return {"recorded": False, "error": "ask and record relationship first"}
-    if question == "decision" and done.get("understands") != "yes":
+    if question == "decision" and answer != "no" and done.get("understands") != "yes":
         return {"recorded": False, "error": "ask and record understands first"}
     if state.get("aval_outcome") and question != "decision":
         return {"recorded": False, "error": "already recorded"}
