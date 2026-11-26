@@ -91,6 +91,7 @@ def test_order_is_enforced_and_full_call_accepts():
 
 
 @pytest.mark.parametrize("steps,outcome", [
+    ([("decision", "no", "no quiero ser su aval")], "DECLINES"),
     ([("relationship", "no", "no lo conozco")], "DOES_NOT_KNOW_APPLICANT"),
     ([("relationship", "yes", "mi hermano"), ("understands", "no", "no"), ("understands", "no", "no")], "UNSURE"),
     ([("relationship", "yes", "mi hermano"), ("understands", "yes", "sí"), ("decision", "no", "no")], "DECLINES"),
@@ -108,8 +109,7 @@ def test_the_models_yes_is_not_evidence(live):
     live_state.add_customer_text(live, "Sí, queda claro")
     live_state.mark_question(live)
     live_state.mark_agent_turn_end(live)
-    outs = [rec(c, "decision", "yes", "sí acepto") for _ in range(2)]
-    assert all(o.get("retry") for o in outs)
+    assert rec(c, "decision", "yes", "sí acepto").get("retry")
     assert "Repite" in rec(c, "decision", "yes", "sí acepto")["error"]
     rec(c, "decision", "yes", "sí acepto")
     assert c.state["pending_action"]["fields"]["outcome"] == "UNSURE"

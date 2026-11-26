@@ -57,6 +57,7 @@ SILENCE_NUDGE_S = 10       # customer silent this long after the agent finished 
 # adapts to the line (voice/audio.py LineLevel); BARGE_IN_ENERGY is its ceiling.
 BARGE_IN_ENERGY = float(os.environ.get("VOICE_BARGE_IN_ENERGY", "900"))
 BARGE_IN_FRAMES = 5
+MAX_UNVERIFIED_TURNS = 5   # identity not confirmed by then → close
 START_TIMEOUT_S = 10       # Twilio sends "start" right after connecting
 
 _session_service = InMemorySessionService()
@@ -182,6 +183,7 @@ class TwilioCall:
         self._heard_at: float | None = None   # customer speech the agent has not answered yet
         self._tools_pending = 0
         self._stop_noted = False
+        self._unverified_noted = False
         self.level = LineLevel(ceiling=BARGE_IN_ENERGY)
         self.hangup = asyncio.Event()       # close the socket now
         self._mark_seq = 0
@@ -255,6 +257,16 @@ class TwilioCall:
                 "[Sistema] La persona pidió que no la llamen. Llama request_human, discúlpate, "
                 "despídete y termina la llamada. No preguntes nada más."))
 
+    def _note_unverified(self) -> None:
+        """Live runs kept asking an impostor for the name for over four minutes."""
+        if (self.result.identityConfirmed or self._unverified_noted or self.ending
+                or self.result.agentTurns < MAX_UNVERIFIED_TURNS):
+            return
+        self._unverified_noted = True
+        self.queue.send_content(_system_text(
+            "[Sistema] No se pudo confirmar la identidad. No preguntes más: despídete sin decir el motivo "
+            "y termina la llamada con end_call."))
+
     async def _hang_up_after_goodbye(self) -> None:
         """The goodbye is queued in Twilio; a mark comes back once it has played."""
         self._mark_seq += 1
@@ -285,7 +297,7 @@ class TwilioCall:
                 # already answering, and must not split the agent's turn.
                 if event.input_transcription and event.input_transcription.text and event.partial:
                     self._customer_text.append(event.input_transcription.text)
-                    live_state.add_customer_text(self._session_id, event.input_transcription.text)
+                    # live_state hears it at the socket (voice/live_tools.py), not here.
                     self._spoke_since_customer = False
                     self._last_activity = time.monotonic()
                 if (event.output_transcription and event.output_transcription.text and event.partial
@@ -339,6 +351,7 @@ class TwilioCall:
                     self._flush_turn("agent")
                     self.result.agentTurns += 1
                     self._note_stop()
+                    self._note_unverified()
                     live_state.mark_agent_turn_end(self._session_id)
                     self._agent_talking = False
                     self._last_activity = time.monotonic()
@@ -391,6 +404,7 @@ class TwilioCall:
         self._session_id = f"aval-{self.result.callSid or uuid.uuid4().hex}"
         context = build_call_context(self.payload, hermosillo_now())
         live_state.register(self._session_id)
+        live_state.current_session.set(self._session_id)
         await _session_service.create_session(
             app_name=APP_NAME, user_id=self._user_id, session_id=self._session_id,
             # Handed to the model only by confirm_guarantor_identity; the declared

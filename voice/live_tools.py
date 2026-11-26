@@ -15,8 +15,11 @@ from google.genai import types
 _END = object()
 
 
-def deliver_tool_calls_now(connection):
-    """Patches one live connection (not the classes) and returns it."""
+def deliver_tool_calls_now(connection, on_customer_text=None):
+    """Patches one live connection (not the classes) and returns it.
+
+    on_customer_text(text) gets the input transcription as it arrives, also while a
+    tool is running — ADK delivers no event until the tool returns."""
     session = getattr(connection, "_gemini_session", None)
     if session is None:
         return connection
@@ -29,6 +32,9 @@ def deliver_tool_calls_now(connection):
                 queue.put_nowait(LlmResponse(content=types.Content(role="model", parts=[
                     types.Part(function_call=fc) for fc in message.tool_call.function_calls or []])))
                 message.tool_call = None
+            heard = message.server_content and message.server_content.input_transcription
+            if on_customer_text and heard and heard.text:
+                on_customer_text(heard.text)
             yield message
 
     async def pump():
