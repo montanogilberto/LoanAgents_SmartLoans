@@ -168,6 +168,7 @@ def test_outcomes_after_the_call():
 def test_other_agents_token_or_no_secret_is_refused(monkeypatch, secret):
     monkeypatch.delenv("TWILIO_AUTH_TOKEN", raising=False)
     monkeypatch.delenv("AVAL_CALL_SECRET", raising=False)
+    monkeypatch.delenv("VOICE_CALL_SECRET", raising=False)
     if secret:
         monkeypatch.setenv("AVAL_CALL_SECRET", secret)
     app = FastAPI()
@@ -218,3 +219,44 @@ def test_tool_calls_are_delivered_before_the_turn_ends():
         return out
     out = asyncio.run(asyncio.wait_for(run(), 5))
     assert out[0].content.parts[0].function_call.name == "end_call" and out[1] == "turn_complete"
+
+
+def test_the_result_goes_to_the_backend_with_ids_only(monkeypatch):
+    from config import settings
+    sent = []
+    monkeypatch.setattr(settings, "WORKER_KEY", "k")
+    monkeypatch.setattr(settings, "SMARTLOANS_BACKEND_URL", "https://backend.test")
+    monkeypatch.setattr(bridge.threading, "Thread", lambda target, daemon: SimpleNamespace(start=target))
+    import httpx
+    monkeypatch.setattr(httpx, "post", lambda url, json, headers, timeout: sent.append((url, json, headers))
+                        or SimpleNamespace(status_code=200))
+    result = bridge.CallResult(callSid="CA1", companyId=1008, clientId=5457, guarantorId=7,
+                               identityConfirmed=True, transcript=[{"speaker": "customer", "text": "Ana Pérez, sí"}],
+                               proposals=[{"capability": "GUARANTOR_CALL_RESULT", "fields": {"outcome": "ACCEPTS"}}])
+    assert bridge.report_to_backend in bridge.RESULT_HOOKS
+    bridge.report_to_backend(result)
+    (url, body, headers), = sent
+    assert url == "https://backend.test/credit-assessment/guarantor-call-result"
+    assert headers == {"X-Worker-Key": "k"}
+    assert body == {"guarantorCall": [{"companyId": 1008, "guarantorId": 7, "callSid": "CA1",
+                                       "outcome": "ACCEPTS", "identityConfirmed": True}]}
+    assert "Ana" not in str(body)
+    # A person must review it (REQUEST_HUMAN) → no outcome; without a worker key nothing is sent.
+    sent.clear()
+    bridge.report_to_backend(bridge.CallResult(callSid="CA2", companyId=1008, clientId=5457, guarantorId=7,
+                                               proposals=[{"capability": "REQUEST_HUMAN"}]))
+    assert sent[0][1]["guarantorCall"][0]["outcome"] is None
+    monkeypatch.setattr(settings, "WORKER_KEY", "")
+    sent.clear()
+    bridge.report_to_backend(result)
+    assert sent == []
+
+
+def test_the_secretary_secret_is_reused_and_the_purpose_still_guards(monkeypatch):
+    monkeypatch.delenv("AVAL_CALL_SECRET", raising=False)
+    monkeypatch.setenv("VOICE_CALL_SECRET", "secretary-secret")
+    assert bridge.aval_call_secret() == "secretary-secret"
+    monkeypatch.setenv("AVAL_CALL_SECRET", "own")
+    assert bridge.aval_call_secret() == "own"
+    # A secretary token (no purpose "aval") is refused even with the same secret.
+    assert bridge.refusal({"companyId": 1008, "clientId": 5}, datetime(2026, 11, 27, 10, 0)) == "not_an_aval_token"

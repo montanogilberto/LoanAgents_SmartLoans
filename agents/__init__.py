@@ -35,6 +35,7 @@ from agents.service_finder import service_finder_agent
 from agents.business_menu import business_menu_agent
 from agents.proof_of_address import proof_of_address_agent
 from agents.payroll_receipt import payroll_receipt_agent
+from agents.smart_score import smart_score_agent
 
 root_agent = orchestrator_agent
 
@@ -75,5 +76,6 @@ __all__ = [
     "business_menu_agent",
     "proof_of_address_agent",
     "payroll_receipt_agent",
+    "smart_score_agent",
     "root_agent",
 ]

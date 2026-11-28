@@ -66,6 +66,7 @@ from voice.collections_bridge import router as collections_voice_router
 from voice.aval_bridge import router as aval_voice_router
 from collections_api import router as collections_router
 from proof_documents_api import router as proof_documents_router
+from smart_score_api import router as smart_score_router
 from metering import MeteredRunner, metering_middleware
 from tools.backend_api import get_credit_score, get_client_loans, list_products, list_suppliers
 from tools.operational_notices import context_notices, fetch_active_notices
@@ -142,6 +143,8 @@ app.include_router(collections_router)
 app.include_router(aval_voice_router)
 # Comprobante de domicilio / nómina vs INE. Same rule: off until enabled.
 app.include_router(proof_documents_router)
+# smartScore (payment capacity, shadow mode). Same rule: off until enabled.
+app.include_router(smart_score_router)
 
 
 def _strip_json_fences(text: str) -> str:

@@ -1,7 +1,7 @@
 """
 Live calls to a proposed aval — copy of voice/collections_bridge.py for
-aval_voice_agent. Independent: its own route and its own secret
-(AVAL_CALL_SECRET; unset = every call is refused, so it is OFF by default).
+aval_voice_agent. Independent route; secret AVAL_CALL_SECRET, else the secretary's VOICE_CALL_SECRET
+(neither set = every call is refused). The signed purpose "aval" keeps other tokens out.
 
 This module answers a stream; it can't dial. smartloans_backend dials and signs who
 is called and for whom. Nothing is written and no result is delivered anywhere yet:
@@ -17,6 +17,7 @@ import hmac
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -463,6 +464,41 @@ def ensure_outcome(result: CallResult) -> None:
         result.proposals.append(request_human("llamada sin resultado registrado: revisar"))
 
 
+def aval_call_secret() -> str:
+    """AVAL_CALL_SECRET, else the secretary's VOICE_CALL_SECRET (user 2026-11-27: reuse the call
+    setup the backend already has). The token's purpose "aval" still keeps a secretary token out."""
+    return os.environ.get("AVAL_CALL_SECRET", "") or os.environ.get("VOICE_CALL_SECRET", "")
+
+
+def report_to_backend(result: CallResult) -> None:
+    """Sends the outcome to smartloans_backend (worker key), which records it and, for ACCEPTS with
+    the identity confirmed, verifies GUARANTOR. In a thread: the call socket never waits on it.
+    Ids and the outcome only: no transcript, name or phone."""
+    from config import settings
+
+    if not settings.WORKER_KEY or not result.guarantorId:
+        return
+    found = (result.outcome or {}).get("fields") or {}   # a pending_action: {capability, fields, ...}
+    body = {"guarantorCall": [{
+        "companyId": result.companyId, "guarantorId": result.guarantorId, "callSid": result.callSid or "no-sid",
+        "outcome": found.get("outcome"), "identityConfirmed": bool(result.identityConfirmed),
+    }]}
+
+    def send() -> None:
+        import httpx
+        try:
+            resp = httpx.post(f"{settings.SMARTLOANS_BACKEND_URL}/credit-assessment/guarantor-call-result",
+                              json=body, headers={"X-Worker-Key": settings.WORKER_KEY}, timeout=20.0)
+            logger.info("[aval] result delivered guarantorId=%s status=%s", result.guarantorId, resp.status_code)
+        except Exception as exc:  # noqa: BLE001 — the type only
+            logger.warning("[aval] result delivery failed guarantorId=%s: %s", result.guarantorId, type(exc).__name__)
+
+    threading.Thread(target=send, daemon=True).start()
+
+
+RESULT_HOOKS.append(report_to_backend)
+
+
 def _deliver(result: CallResult) -> None:
     ensure_outcome(result)
     logger.info("[aval] call finished %s", json.dumps(result.safe_summary()))
@@ -513,7 +549,7 @@ async def twilio_stream(ws: WebSocket) -> None:
     try:
         start = await asyncio.wait_for(_wait_for_start(ws), START_TIMEOUT_S)
         params = start.get("customParameters") or {}
-        payload = verify_call_token(params.get("token", ""), os.environ.get("AVAL_CALL_SECRET", ""))
+        payload = verify_call_token(params.get("token", ""), aval_call_secret())
     except (asyncio.TimeoutError, InvalidCallToken, WebSocketDisconnect, ValueError, KeyError) as exc:
         logger.warning("[aval] stream refused: %s", type(exc).__name__ if not isinstance(exc, InvalidCallToken) else exc)
         try:
